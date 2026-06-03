@@ -138,6 +138,14 @@ class PythonBuilder(Builder):
             cleaner()
             raise BuildError(f"Entry symbol '{entry_symbol}' is not callable")
 
+        # Optional per-workload setup hook: if the module exports a top-level ``setup``
+        # symbol, the framework will invoke it once per workload before timed runs and
+        # splat its returned dict as kwargs into ``run``. Used for derived static state
+        # (CSR indptr, expert ids, workspace tensors, plan handles).
+        setup_fn = getattr(mod, "setup", None)
+        if setup_fn is not None and not callable(setup_fn):
+            setup_fn = None
+
         metadata = RunnableMetadata(
             build_type="python",
             definition_name=definition.name,
@@ -149,4 +157,4 @@ class PythonBuilder(Builder):
 
         self._try_validate_signature(fn, definition, solution)
 
-        return Runnable(callable=fn, metadata=metadata, cleaner=cleaner)
+        return Runnable(callable=fn, metadata=metadata, cleaner=cleaner, setup_callable=setup_fn)

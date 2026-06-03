@@ -159,12 +159,17 @@ class Builder(ABC):
         )
 
         # Validate against the actual call shape used by benchmark/apply runtime: a fixed number
-        # of positional arguments derived from the definition. This accepts extra optional
-        # parameters with defaults while still rejecting missing required or keyword-only
-        # parameters that cannot be satisfied by positional calling.
+        # of positional arguments derived from the definition. We allow keyword-only parameters
+        # (with or without defaults) because they are reserved for the framework's per-workload
+        # setup hook (Runnable.setup_for_workload splats the setup() return dict as kwargs).
         sample_args = [object() for _ in range(expected_nparam)]
+        kw_only_sample = {
+            name: object()
+            for name, p in signature.parameters.items()
+            if p.kind == inspect.Parameter.KEYWORD_ONLY
+        }
         try:
-            signature.bind(*sample_args)
+            signature.bind(*sample_args, **kw_only_sample)
         except TypeError as e:
             style = "Destination-passing" if dps else "Value-returning"
             raise BuildError(
