@@ -13,8 +13,10 @@ from flashinfer_bench.data import (
     Environment,
     Evaluation,
     EvaluationStatus,
+    InputSpec,
     Performance,
     RandomInput,
+    RandomUe8m0Input,
     Solution,
     SourceFile,
     SupportedLanguages,
@@ -26,6 +28,7 @@ from flashinfer_bench.data import (
     save_json_file,
     save_jsonl_file,
 )
+from pydantic import TypeAdapter
 
 
 def make_minimal_objects() -> Tuple[Definition, Solution, Trace]:
@@ -120,6 +123,22 @@ def test_save_and_load_json_and_jsonl(tmp_path: Path):
     loaded_list = load_jsonl_file(Trace, pathl)
     assert len(loaded_list) == 2
     assert loaded_list[0].is_workload_trace()
+
+
+def test_random_ue8m0_input_roundtrip():
+    workload = Workload(
+        axes={"M": 2},
+        inputs={"A": RandomInput(), "scale": RandomUe8m0Input()},
+        uuid="w_ue8m0",
+    )
+    restored = Workload.model_validate_json(workload.model_dump_json())
+    assert isinstance(restored.inputs["scale"], RandomUe8m0Input)
+    assert restored.inputs["scale"].type == "random_ue8m0"
+
+    # Discriminator on the InputSpec union must resolve from the JSON tag.
+    adapter = TypeAdapter(InputSpec)
+    decoded = adapter.validate_python({"type": "random_ue8m0"})
+    assert isinstance(decoded, RandomUe8m0Input)
 
 
 def test_dict_to_dataclass_with_invalid_fields():

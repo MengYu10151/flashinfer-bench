@@ -23,6 +23,7 @@ from flashinfer_bench.data import (
     Definition,
     EvaluationStatus,
     RandomInput,
+    RandomUe8m0Input,
     SafetensorsInput,
     ScalarInput,
     Solution,
@@ -119,6 +120,51 @@ def test_gen_inputs_random_and_scalar_cpu():
     assert out[0].shape == (2, 3) and out[0].dtype == torch.float32  # X
     assert out[1].shape == (2, 3) and out[1].dtype == torch.int32  # Y
     assert out[2] == 7  # S
+
+
+def test_gen_inputs_random_ue8m0_cpu():
+    definition = Definition(
+        name="d_ue8m0",
+        op_type="op",
+        axes={"M": AxisConst(value=4), "N": AxisConst(value=8)},
+        inputs={"scale": TensorSpec(shape=["M", "N"], dtype="float32")},
+        outputs={"O": TensorSpec(shape=["M", "N"], dtype="float32")},
+        reference="def run(scale):\n    return scale\n",
+    )
+    workload = Workload(
+        axes={"M": 4, "N": 8},
+        inputs={"scale": RandomUe8m0Input()},
+        uuid="w_ue8m0",
+    )
+    out = gen_inputs(definition, workload, device="cpu", safe_tensors={})
+    scale = out[0]
+    assert scale.shape == (4, 8) and scale.dtype == torch.float32
+
+    # Every value must be a canonical ue8m0 number: fp32 layout with mantissa == 0
+    # and finite (exponent in [1, 254]).
+    bits = scale.view(torch.int32)
+    mantissa = bits & 0x7FFFFF
+    exp = (bits >> 23) & 0xFF
+    assert torch.equal(mantissa, torch.zeros_like(mantissa))
+    assert (exp >= 1).all() and (exp <= 254).all()
+
+
+def test_gen_inputs_random_ue8m0_rejects_non_fp32():
+    definition = Definition(
+        name="d_ue8m0_bad",
+        op_type="op",
+        axes={"M": AxisConst(value=2)},
+        inputs={"scale": TensorSpec(shape=["M"], dtype="bfloat16")},
+        outputs={"O": TensorSpec(shape=["M"], dtype="bfloat16")},
+        reference="def run(scale):\n    return scale\n",
+    )
+    workload = Workload(
+        axes={"M": 2},
+        inputs={"scale": RandomUe8m0Input()},
+        uuid="w_ue8m0_bad",
+    )
+    with pytest.raises(ValueError, match="random_ue8m0 only supports float32"):
+        gen_inputs(definition, workload, device="cpu", safe_tensors={})
 
 
 @pytest.mark.skipif(

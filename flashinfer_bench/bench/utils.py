@@ -25,6 +25,18 @@ from flashinfer_bench.data import (
 from flashinfer_bench.utils import dtype_str_to_torch_dtype, env_snapshot
 
 
+def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    """Project fp32 scale values to the ue8m0 subset (powers of 2, zero mantissa).
+
+    Matches the rounding that sm_100+ FP8 GEMM hardware applies internally to
+    block-scale tensors. Output is still fp32 dtype but each value satisfies
+    ``mantissa == 0``, equivalent to a ue8m0 value embedded in fp32 layout.
+    """
+    bits = x.abs().float().view(torch.int)
+    exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().int()
+    return (exp.clamp(1, 254) << 23).view(torch.float)
+
+
 def _rand_tensor(shape: List[int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     if dtype in (torch.float32, torch.float16, torch.bfloat16):
         return torch.randn(shape, dtype=dtype, device=device)
@@ -50,6 +62,16 @@ def _rand_tensor(shape: List[int], dtype: torch.dtype, device: torch.device) -> 
         return torch.randint(low, high, shape, device=device, dtype=dtype)
 
     raise ValueError(f"Unsupported random dtype: {dtype}")
+
+
+def _rand_ue8m0_tensor(
+    shape: List[int], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Generate a random tensor whose values are canonical ue8m0 scales (fp32 layout)."""
+    if dtype != torch.float32:
+        raise ValueError(f"random_ue8m0 only supports float32 dtype, got {dtype}")
+    raw = torch.rand(shape, dtype=torch.float32, device=device).clamp_(1e-3, 2.0)
+    return _ceil_to_ue8m0(raw)
 
 
 def normalize_outputs(
@@ -281,6 +303,11 @@ def gen_inputs(
             out.append(t_cpu.to(device=dev, non_blocking=True))
         elif name in workload.inputs and workload.inputs[name].type == "scalar":
             out.append(workload.inputs[name].value)
+        elif name in workload.inputs and workload.inputs[name].type == "random_ue8m0":
+            shape = shapes[idx]
+            if shape is None:
+                raise ValueError(f"random_ue8m0 input '{name}' requires a tensor shape")
+            out.append(_rand_ue8m0_tensor(shape, dtype, dev))
         else:  # random
             shape = shapes[idx]
 

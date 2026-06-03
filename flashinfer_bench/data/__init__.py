@@ -11,7 +11,14 @@ from .json_utils import (
 from .solution import BuildSpec, Solution, SourceFile, SupportedBindings, SupportedLanguages
 from .trace import Correctness, Environment, Evaluation, EvaluationStatus, Performance, Trace
 from .trace_set import SpeedupMetrics, TraceSet, TraceSetSummary
-from .workload import InputSpec, RandomInput, SafetensorsInput, ScalarInput, Workload
+from .workload import (
+    InputSpec,
+    RandomInput,
+    RandomUe8m0Input,
+    SafetensorsInput,
+    ScalarInput,
+    Workload,
+)
 
 __all__ = [
     # Definition types
@@ -28,6 +35,7 @@ __all__ = [
     "Solution",
     # Workload types
     "RandomInput",
+    "RandomUe8m0Input",
     "ScalarInput",
     "SafetensorsInput",
     "InputSpec",

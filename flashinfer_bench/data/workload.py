@@ -16,6 +16,19 @@ class RandomInput(BaseModelWithDocstrings):
     """The input type identifier for random data generation."""
 
 
+class RandomUe8m0Input(BaseModelWithDocstrings):
+    """Random ue8m0-canonical float input generation descriptor.
+
+    Generates fp32 values constrained to the ue8m0 subset (powers of 2 with zero
+    mantissa). Use for FP8 block-scale tensors where the canonical quantization
+    recipe stores scales as ue8m0; this avoids the need for solutions or references
+    to round non-canonical fp32 values at run time.
+    """
+
+    type: Literal["random_ue8m0"] = "random_ue8m0"
+    """The input type identifier for ue8m0-canonical random data generation."""
+
+
 class ScalarInput(BaseModelWithDocstrings):
     """Scalar literal input specification.
 
@@ -45,7 +58,7 @@ class SafetensorsInput(BaseModelWithDocstrings):
     """Key identifier for the specific tensor within the safetensors file."""
 
 
-InputSpec = Union[RandomInput, SafetensorsInput, ScalarInput]
+InputSpec = Union[RandomInput, RandomUe8m0Input, SafetensorsInput, ScalarInput]
 """Union type representing all possible input specification types."""
 
 
