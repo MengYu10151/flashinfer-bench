@@ -365,7 +365,44 @@ def test_validate_signature_dps_missing():
         )
 
 
-def test_validate_signature_dps_required_kwonly():
+def test_validate_signature_dps_kwonly_accepted_for_setup_hook_injection():
+    """Keyword-only parameters are accepted (ab70330) — reserved for setup hook state injection.
+
+    Previously this raised BuildError; now the validator tolerates required kw-only args
+    because they map to dict keys returned by the optional ``setup()`` symbol.
+    """
+    # Required kw-only
+    def func_required_kwonly(A, B, out, *, scale):
+        pass
+
+    _make_signature_builder()._try_validate_signature(
+        func_required_kwonly, _make_dps_definition(), _make_dps_solution()
+    )  # No raise
+
+    # Multiple kw-only
+    def func_multi_kwonly(A, B, out, *, scale, m_indptr):
+        pass
+
+    _make_signature_builder()._try_validate_signature(
+        func_multi_kwonly, _make_dps_definition(), _make_dps_solution()
+    )  # No raise
+
+
+def test_validate_signature_dps_kwonly_with_default_accepted():
+    """Keyword-only parameters with defaults are also accepted (degenerate case of the above)."""
+
+    def func(A, B, out, *, scale=1.0):
+        pass
+
+    _make_signature_builder()._try_validate_signature(
+        func, _make_dps_definition(), _make_dps_solution()
+    )  # No raise
+
+
+def test_validate_signature_kwonly_does_not_count_as_positional():
+    """Missing positional args still raise BuildError even when kw-only args exist."""
+
+    # Only 2 positional params but definition expects 3 (A, B, out) for DPS
     def func(A, B, *, out):
         pass
 

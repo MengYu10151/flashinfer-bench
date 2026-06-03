@@ -107,11 +107,14 @@ class DefaultEvaluator(Evaluator):
                 if is_dps:
                     # DPS style: allocate outputs and call with them
                     out = allocate_outputs(definition, inp, device)
+                    # Per-workload setup (no-op if the solution defines no setup hook).
+                    sol_runnable.setup_for_workload(*inp, *out)
                     with torch.no_grad():
                         sol_runnable(*inp, *out)
                     torch.cuda.synchronize(device)
                 else:
                     # Value-returning style: call and normalize result
+                    sol_runnable.setup_for_workload(*inp)
                     with torch.no_grad():
                         result = sol_runnable(*inp)
                     torch.cuda.synchronize(device)
@@ -199,6 +202,8 @@ class DefaultEvaluator(Evaluator):
                 else:
                     # Value-returning style
                     args = list(inp)
+                # Per-workload setup (no-op if the solution defines no setup hook).
+                sol_runnable.setup_for_workload(*args)
                 ms = time_runnable(sol_runnable, args, cfg.warmup_runs, cfg.iterations, device)
                 sol_latencies.append(ms)
         except Exception:

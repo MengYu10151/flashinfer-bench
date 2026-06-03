@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from flashinfer_bench.bench.config import BenchmarkConfig
+from flashinfer_bench.bench.config import BenchmarkConfig, ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators import default as default_eval_module
 from flashinfer_bench.bench.evaluators import resolve_evaluator
 from flashinfer_bench.bench.evaluators import sampling as sampling_eval_module
@@ -81,6 +81,73 @@ def _make_vr_mock(result_tensor):
 # =============================================================================
 # DefaultEvaluator Tests
 # =============================================================================
+
+
+class TestDefaultEvaluatorSetupHook:
+    """Tests that DefaultEvaluator invokes setup_for_workload() once per workload (ab70330)."""
+
+    @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="CUDA devices not available")
+    def test_setup_for_workload_called_in_correctness_and_perf(self, tmp_path: Path):
+        """A passing workload triggers setup_for_workload twice: once in correctness check and once in perf eval."""
+        definition = _simple_def()
+        # NOTE: use ResolvedEvalConfig (atol/rtol have float defaults).
+        # BenchmarkConfig leaves atol/rtol as None which only get filled in by
+        # resolve_eval_config() — passing BenchmarkConfig straight to evaluator
+        # causes compute_error_stats to raise TypeError on `tensor > None`.
+        cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
+        device = "cuda:0"
+        dev = torch.device(device)
+        # Single workload (mock writes the same ref tensor across all workloads,
+        # so multi-workload tests would fail correctness on the 2nd onward).
+        inp = [torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)]
+        ref_tensor = inp[0].clone()
+        runnable = _make_dps_mock(ref_tensor)
+
+        evaluation = DefaultEvaluator.evaluate(
+            definition=definition,
+            sol_runnable=runnable,
+            inputs=[inp],
+            ref_outputs=[[ref_tensor]],
+            ref_mean_latency_ms=1.0,
+            cfg=cfg,
+            log_path=str(tmp_path / "log"),
+            device=device,
+        )
+
+        # Workload passes correctness → both correctness and perf loops run.
+        # Each loop calls setup_for_workload once per workload, so total = 2.
+        assert evaluation.status == EvaluationStatus.PASSED
+        assert runnable.setup_for_workload.call_count == 2
+
+    @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="CUDA devices not available")
+    def test_setup_for_workload_called_with_dps_args(self, tmp_path: Path):
+        """In DPS mode, setup_for_workload receives (*inputs, *outputs) — same signature as run()."""
+        definition = _simple_def()
+        cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
+        device = "cuda:0"
+        dev = torch.device(device)
+        inp = [torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)]
+        ref_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)
+        runnable = _make_dps_mock(ref_tensor)
+
+        DefaultEvaluator.evaluate(
+            definition=definition,
+            sol_runnable=runnable,
+            inputs=[inp],
+            ref_outputs=[[ref_tensor]],
+            ref_mean_latency_ms=1.0,
+            cfg=cfg,
+            log_path=str(tmp_path / "log"),
+            device=device,
+        )
+
+        # The DPS evaluator calls setup_for_workload(*inp, *output_tensors).
+        # Definition has 1 input + 1 output, so each call receives 2 positional args.
+        for call in runnable.setup_for_workload.call_args_list:
+            args, kwargs = call
+            assert len(args) == 2
+            assert all(isinstance(a, torch.Tensor) for a in args)
+            assert kwargs == {}
 
 
 class TestDefaultEvaluatorDPS:

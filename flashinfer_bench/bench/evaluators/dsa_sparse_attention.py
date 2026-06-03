@@ -49,10 +49,12 @@ class DsaSparseAttentionEvaluator(DefaultEvaluator):
             try:
                 if is_dps:
                     out = allocate_outputs(definition, inp, device)
+                    sol_runnable.setup_for_workload(*inp, *out)
                     with torch.no_grad():
                         sol_runnable(*inp, *out)
                     torch.cuda.synchronize(device)
                 else:
+                    sol_runnable.setup_for_workload(*inp)
                     with torch.no_grad():
                         result = sol_runnable(*inp)
                     torch.cuda.synchronize(device)

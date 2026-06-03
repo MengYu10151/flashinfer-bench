@@ -1,4 +1,5 @@
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,86 @@ def run(A=None, B=None, C=None, stream=None):
     C = torch.empty_like(A)
     runnable(A, B, C)
     assert torch.allclose(C, A)
+
+
+def _make_pass_through_def() -> Definition:
+    return Definition(
+        name="pass",
+        op_type="op",
+        axes={"M": AxisConst(value=2)},
+        inputs={"A": TensorSpec(shape=["M"], dtype="float32")},
+        outputs={"B": TensorSpec(shape=["M"], dtype="float32")},
+        reference="def run(A):\n    return A\n",
+    )
+
+
+def _make_solution(content: str, name: str = "py_sol") -> Solution:
+    return Solution(
+        name=name,
+        definition="pass",
+        author="me",
+        spec=BuildSpec(
+            language=SupportedLanguages.PYTHON,
+            target_hardware=["cpu"],
+            entry_point="main.py::run",
+            destination_passing_style=True,
+        ),
+        sources=[SourceFile(path="main.py", content=content)],
+    )
+
+
+def test_python_builder_detects_optional_setup_symbol():
+    """PythonBuilder picks up a top-level `setup` symbol and passes it to Runnable."""
+    content = textwrap.dedent(
+        """
+        def setup(A, B):
+            return {"scale": 7}
+
+        def run(A, B, *, scale):
+            B.copy_(A * scale)
+        """
+    )
+    definition = _make_pass_through_def()
+    solution = _make_solution(content, name="py_sol_with_setup")
+    builder = PythonBuilder()
+    runnable = builder.build(definition, solution)
+
+    assert runnable._setup_callable is not None
+    assert callable(runnable._setup_callable)
+
+    # End-to-end: setup_for_workload + call splats kwargs in
+    A = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    B = torch.zeros((2,), dtype=torch.float32)
+    runnable.setup_for_workload(A, B)
+    runnable(A, B)
+    assert torch.allclose(B, torch.tensor([7.0, 14.0]))
+
+
+def test_python_builder_no_setup_symbol_keeps_setup_callable_none():
+    """When the solution module has no `setup` symbol, setup_callable stays None."""
+    content = "def run(A, B):\n    B.copy_(A)\n"
+    definition = _make_pass_through_def()
+    solution = _make_solution(content, name="py_sol_no_setup")
+    builder = PythonBuilder()
+    runnable = builder.build(definition, solution)
+    assert runnable._setup_callable is None
+
+
+def test_python_builder_ignores_non_callable_setup_symbol():
+    """A `setup` name that is not callable (e.g. a constant) is treated as if absent."""
+    content = textwrap.dedent(
+        """
+        setup = "not callable"
+
+        def run(A, B):
+            B.copy_(A)
+        """
+    )
+    definition = _make_pass_through_def()
+    solution = _make_solution(content, name="py_sol_bad_setup")
+    builder = PythonBuilder()
+    runnable = builder.build(definition, solution)
+    assert runnable._setup_callable is None
 
 
 if __name__ == "__main__":
