@@ -5,8 +5,6 @@ Timing utilities for benchmarking FlashInfer-Bench kernel solutions.
 from __future__ import annotations
 
 import statistics
-from multiprocessing import Lock
-from multiprocessing.synchronize import Lock as LockType
 from typing import Any, List
 
 import torch
@@ -14,34 +12,10 @@ from flashinfer.testing import bench_gpu_time_with_cupti
 
 from flashinfer_bench.compile import Runnable
 
-# Device-specific lock registry to ensure multiprocess-safe benchmarking
-_device_locks: dict[str, LockType] = {}
-_registry_lock = Lock()
+from ._common import _device_lock
+from .two_mode import ThreeMetrics, time_runnable_two_mode
 
-
-def _device_lock(device: str) -> LockType:
-    """Get or create a multiprocessing lock for the specified device.
-
-    This function maintains a registry of locks per device to ensure that
-    benchmarking operations on the same device are serialized, preventing
-    interference between concurrent measurements.
-
-    Parameters
-    ----------
-    device : str
-        The device identifier (e.g., "cuda:0", "cuda:1").
-
-    Returns
-    -------
-    LockType
-        A lock object specific to the given device.
-    """
-    with _registry_lock:
-        lock = _device_locks.get(device)
-        if lock is None:
-            lock = Lock()
-            _device_locks[device] = lock
-        return lock
+__all__ = ["time_runnable", "time_runnable_two_mode", "ThreeMetrics"]
 
 
 def time_runnable(fn: Runnable, args: List[Any], warmup: int, iters: int, device: str) -> float:
