@@ -85,9 +85,7 @@ def main() -> None:
     kv_page_indptr = torch.tensor(
         [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device=device
     )
-    kv_last_page_len = torch.tensor(
-        [1, 1, 1, 1, 1, 1, 1], dtype=torch.int32, device=device
-    )
+    kv_last_page_len = torch.tensor([1, 1, 1, 1, 1, 1, 1], dtype=torch.int32, device=device)
 
     args = [q, kv_cache, qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_len]
     metrics = time_runnable_two_mode(

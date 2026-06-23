@@ -126,11 +126,7 @@ def _median_cudaevent(fn: Callable[[], Any], iters: int, device: str) -> float:
 
 
 def _measure_e2e(
-    runnable: Runnable,
-    args: List[Any],
-    warmup: int,
-    iters: int,
-    device: str,
+    runnable: Runnable, args: List[Any], warmup: int, iters: int, device: str
 ) -> float:
     """e2e_ms — clone all tensor args + re-run setup + run inside the timed region.
 
@@ -157,12 +153,7 @@ def _measure_e2e(
 
 
 def _measure_kernel_cudagraph(
-    runnable: Runnable,
-    args: List[Any],
-    warmup: int,
-    graph_iters: int,
-    replays: int,
-    device: str,
+    runnable: Runnable, args: List[Any], warmup: int, graph_iters: int, replays: int, device: str
 ) -> Tuple[float, str]:
     """kernel_ms — setup ONCE outside; capture ``run()`` into a CUDA graph;
     cudaEvent over graph replay (divided by ``graph_iters`` per replay).
@@ -202,11 +193,7 @@ def _measure_kernel_cudagraph(
 
 
 def _measure_kernel_gpu_cupti(
-    runnable: Runnable,
-    args: List[Any],
-    warmup: int,
-    iters: int,
-    device: str,
+    runnable: Runnable, args: List[Any], warmup: int, iters: int, device: str
 ) -> Tuple[float, str]:
     """kernel_gpu_ms — setup ONCE outside; ``bench_gpu_time_with_cupti`` on
     eager dispatch. Uses CUPTI activity sum (pure GPU exec, excludes Python

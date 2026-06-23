@@ -11,11 +11,7 @@ import torch
 from flashinfer_bench.bench.config import ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators.evaluator import Evaluator
 from flashinfer_bench.bench.runner.runner import BaselineHandle, DeviceBaseline
-from flashinfer_bench.bench.timing import (
-    ThreeMetrics,
-    time_runnable,
-    time_runnable_two_mode,
-)
+from flashinfer_bench.bench.timing import ThreeMetrics, time_runnable, time_runnable_two_mode
 from flashinfer_bench.bench.utils import (
     compute_error_stats,
     gen_inputs,
@@ -237,8 +233,7 @@ class DefaultEvaluator(Evaluator):
             # Status: report "ok" only if every trial succeeded; else surface
             # the first non-ok value so the user can tell why fallback fired.
             kernel_status = next(
-                (m.kernel_ms_status for m in trial_metrics if m.kernel_ms_status != "ok"),
-                "ok",
+                (m.kernel_ms_status for m in trial_metrics if m.kernel_ms_status != "ok"), "ok"
             )
             kernel_gpu_status = next(
                 (m.kernel_gpu_ms_status for m in trial_metrics if m.kernel_gpu_ms_status != "ok"),
