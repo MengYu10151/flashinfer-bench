@@ -11,7 +11,11 @@ import torch
 from flashinfer_bench.bench.config import ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators.evaluator import Evaluator
 from flashinfer_bench.bench.runner.runner import BaselineHandle, DeviceBaseline
-from flashinfer_bench.bench.timing import time_runnable
+from flashinfer_bench.bench.timing import (
+    ThreeMetrics,
+    time_runnable,
+    time_runnable_two_mode,
+)
 from flashinfer_bench.bench.utils import (
     compute_error_stats,
     gen_inputs,
@@ -190,18 +194,71 @@ class DefaultEvaluator(Evaluator):
         log_path: str,
         device: str,
     ) -> Tuple[Performance, Optional[Evaluation]]:
-        sol_latencies: List[float] = []
         is_dps = sol_runnable.metadata.destination_passing_style
 
+        def _args_for(inp: List[Any]) -> List[Any]:
+            if is_dps:
+                return list(inp) + allocate_outputs(definition, inp, device)
+            return list(inp)
+
+        if cfg.two_mode:
+            try:
+                trial_metrics: List[ThreeMetrics] = []
+                for inp in inputs:
+                    args = _args_for(inp)
+                    # time_runnable_two_mode handles setup invocation internally
+                    # (once-outside for kernel_ms / kernel_gpu_ms; per-iter for
+                    # e2e_ms). Do NOT call setup_for_workload here.
+                    metrics = time_runnable_two_mode(
+                        sol_runnable,
+                        args,
+                        cfg.warmup_runs,
+                        cfg.iterations,
+                        device,
+                        graph_iters=cfg.graph_iters,
+                    )
+                    trial_metrics.append(metrics)
+            except Exception:
+                traceback.print_exc()
+                return None, make_eval(
+                    status=EvaluationStatus.RUNTIME_ERROR, device=device, log_path=log_path
+                )
+
+            if not trial_metrics:
+                print("Failed to collect solution latencies", file=sys.stderr)
+                return None, make_eval(
+                    status=EvaluationStatus.RUNTIME_ERROR, device=device, log_path=log_path
+                )
+
+            n = float(len(trial_metrics))
+            e2e_mean = sum(m.e2e_ms for m in trial_metrics) / n
+            kernel_mean = sum(m.kernel_ms for m in trial_metrics) / n
+            kernel_gpu_mean = sum(m.kernel_gpu_ms for m in trial_metrics) / n
+            # Status: report "ok" only if every trial succeeded; else surface
+            # the first non-ok value so the user can tell why fallback fired.
+            kernel_status = next(
+                (m.kernel_ms_status for m in trial_metrics if m.kernel_ms_status != "ok"),
+                "ok",
+            )
+            kernel_gpu_status = next(
+                (m.kernel_gpu_ms_status for m in trial_metrics if m.kernel_gpu_ms_status != "ok"),
+                "ok",
+            )
+            performance = Performance(
+                latency_ms=e2e_mean,
+                reference_latency_ms=ref_mean_latency_ms,
+                speedup_factor=(ref_mean_latency_ms / e2e_mean) if e2e_mean > 0 else 0.0,
+                kernel_ms=kernel_mean,
+                kernel_gpu_ms=kernel_gpu_mean,
+                kernel_ms_status=kernel_status,
+                kernel_gpu_ms_status=kernel_gpu_status,
+            )
+            return performance, None
+
+        sol_latencies: List[float] = []
         try:
             for inp in inputs:
-                if is_dps:
-                    # DPS style: allocate outputs and include in args
-                    output_tensors = allocate_outputs(definition, inp, device)
-                    args = list(inp) + output_tensors
-                else:
-                    # Value-returning style
-                    args = list(inp)
+                args = _args_for(inp)
                 # Per-workload setup (no-op if the solution defines no setup hook).
                 sol_runnable.setup_for_workload(*args)
                 ms = time_runnable(sol_runnable, args, cfg.warmup_runs, cfg.iterations, device)
