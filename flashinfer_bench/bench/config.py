@@ -46,6 +46,17 @@ class ResolvedEvalConfig(BaseModel):
     """Minimum fraction of elements that must be within tolerance."""
     profile_baseline: bool = True
     """Whether to profile the reference implementation for baseline latency."""
+    two_mode: bool = False
+    """Opt-in: collect e2e_ms + kernel_ms + kernel_gpu_ms instead of a single
+    fused latency. When True, evaluators dispatch to ``time_runnable_two_mode``
+    and populate ``Performance.kernel_ms`` / ``kernel_gpu_ms`` alongside
+    ``latency_ms`` (which carries the e2e median). When False, behavior is
+    unchanged from before two-mode was introduced."""
+    graph_iters: int = Field(default=20, gt=0)
+    """When ``two_mode=True``: number of ``run()`` calls captured into a single
+    CUDA graph for the ``kernel_ms`` metric. Replay time is divided by this to
+    get per-call kernel time. Tune up on ultra-small kernels where graph
+    replay overhead dominates."""
     extra: Dict[str, Any] = Field(default_factory=dict)
     """Evaluator-specific parameters after all config layers have been merged."""
 
