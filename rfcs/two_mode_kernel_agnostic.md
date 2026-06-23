@@ -284,19 +284,25 @@ Commits, in order, on `feat/two-mode-kernel-agnostic`:
 No changes to `flashinfer-trace/`. No changes to existing solutions or
 definitions. All single-metric tests remain green.
 
-## 8. Open questions for review
+## 8. Locked design decisions
 
-1. **Public API location** — keep `time_runnable_two_mode` under
-   `bench.timing` or surface it on `flashinfer_bench.testing.*`?
-2. **`graph_iters=20` default** — too small for ultra-small kernels (graph
-   replay overhead dominates)?
-3. **CUPTI `use_cuda_graph` flag** — keep `False` for `kernel_gpu_ms` (CUPTI
-   over eager), or default to `True` (CUPTI over graph)? Both have validity:
-   `False` matches existing `time_runnable`, `True` matches `kernel_ms` so a
-   diff of zero is expected.
-4. **Per-trial vs aggregate metrics** — should `Performance` also store the
-   per-trial vectors for downstream analysis, or just the mean?
-5. **Verify `setup_for_workload` semantics in e2e mode** — calling it every
-   iter is correct *per the definition of e2e* (full wrapper cost) but may
-   double-allocate workspace tensors. Should we add a configurable
-   `e2e_reuse_workspace: bool` knob?
+1. **Stay with menyu's 2-phase contract** (`setup` + `run`); do *not* extend
+   to a 3-phase `pre_process / runtime / post_process` split in this RFC.
+   Post-process is a future-RFC topic (would add an optional third symbol +
+   one extra metric `kernel_full_ms`; non-blocking for v1).
+2. **Public API**: `flashinfer_bench.bench.timing.time_runnable_two_mode`
+   (sibling of the existing `time_runnable`). Not re-exported under
+   `flashinfer_bench.testing.*` for v1.
+3. **`kernel_gpu_ms` uses `bench_gpu_time_with_cupti(use_cuda_graph=False)`**
+   — gives an independent signal vs the cudagraph-based `kernel_ms`. The two
+   metrics deliberately measure on different mechanisms so a discrepancy is
+   diagnostic (per the methodology already validated for R8 / R14).
+4. **`graph_iters=20` default**, exposed via `ResolvedEvalConfig.graph_iters`
+   for tuning on micro-kernels.
+5. **e2e mode reruns `setup_for_workload` per iter** with fresh clones — this
+   is the definition of e2e (full wrapper cost). Workspace double-allocation
+   is *expected* and represents the worst-case naive serving call. No
+   `e2e_reuse_workspace` knob in v1.
+6. **`Performance` records the mean only** for v1 (`kernel_ms`,
+   `kernel_gpu_ms`). Per-trial vectors are out of scope; can be added later as
+   `kernel_ms_per_trial: Optional[List[float]]` without breaking compat.
