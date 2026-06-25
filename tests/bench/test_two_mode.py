@@ -392,7 +392,8 @@ class TestTimeRunnableTwoMode:
             return {}
 
         def _run(t):
-            torch.relu(t, out=out)
+            # add(t,t) supports out=; relu(t, out=…) is missing on some torch builds.
+            torch.add(t, t, out=out)
 
         runnable = _make_runnable(_run, _setup)
         m = time_runnable_two_mode(
