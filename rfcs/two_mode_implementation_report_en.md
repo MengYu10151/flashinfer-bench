@@ -110,8 +110,10 @@ bench_gpu_time_with_cupti(fn=runnable, ..., use_cuda_graph=False)
 | 10 | `41d51ae` | feat+test: detect silent CUPTI fallback (new status `cupti_fallback:cuda_events`) + unit tests `tests/bench/test_two_mode.py` (250 lines, 24/24 pass) |
 | 11 | `6228dc0` | test fix: swap `torch.relu(out=)` for `torch.add(out=)` (nv24.10 compat) |
 | 12 | `44905f2` | feat(bench): add 100 ms cool-down between metric phases (defensive) |
+| 13 | `a9a6fdd` | docs(rfc): R8 decode_b32 root-cause diagnostic + v3 status string |
+| 14 | `8d73f17` | **fix(bench): reorder phases as kernel_ms → kernel_gpu_ms → e2e — eliminates decode_b32 +13 µs bias** |
 
-Diff size: **+1700 / −60 lines across 20 files**.
+Diff size: **+1830 / −62 lines across 20 files**.
 
 ### 3.2 Key files
 
@@ -374,16 +376,36 @@ Only a **process-level reset** can clear these (fork a fresh process or `nvidia-
 
 **Why only decode_b32 is affected**: its e2e_ms = 1468 µs — roughly 3–4× larger than other shapes (the only batch=32 + decode case). Other shapes' e2e ≈ 500 µs and the pollution doesn't accumulate enough to shift FA3's C++ internal state into a different equilibrium. **This is a decode-heavy big-batch artifact, not an engine bug.**
 
-**Impact + mitigations:**
+**Initial mitigations explored:**
 
-- **PR is fine to ship**: the engine is correctness-verified.
-- **Known limitation**: kernel_ms / kernel_gpu_ms measured immediately after e2e carry ~+13 µs (≈ 15%) systematic offset on decode-heavy big-batch shapes. The root state lives in FA3's C++ side and needs process-level reset.
-- **Recommended pattern when µs-level precision matters**:
-  - (a) measure metrics individually — call `_measure_kernel_cudagraph` / `_measure_kernel_gpu_cupti` directly without e2e, or
-  - (b) use `flashinfer-bench run --use-isolated-runner` for process-level isolation (the codebase already has this infrastructure).
-- **`_cool_down(device, 0.1)` (commit `44905f2`)** added between phases as a defensive measure. **It does not fix the decode_b32 bias** (which corroborates that thermal / clock state is not the cause), but is kept as a hedge for thermally-sensitive workloads we haven't tested.
+- **`_cool_down(device, 0.1)` (commit `44905f2`)** added between phases — **did NOT fix the decode_b32 bias** (corroborates that thermal / clock state is not the cause). Kept as a hedge for thermally-sensitive workloads.
 
 Diagnostic script: `/home/scratch.yuny_wwfo/kernel_arena/scripts/62_r8_b32_diag.sh` (+ sbatch 2806102 log).
+
+#### 6.3.2 The actual fix — reorder phases (commit `8d73f17`)
+
+Since the root cause is "whichever measurement runs after e2e takes the +13 µs pollution," the simplest reachable fix is to move e2e **last**. New order:
+
+```
+kernel_ms → kernel_gpu_ms → e2e   # kernel_ms gets cold FA3 state
+```
+
+e2e by definition incorporates all wrapper overhead, so what came before is irrelevant to its semantics. Metric definitions are unchanged — reordering only changes which metric gets the "clean state, polluted state, doesn't care" position.
+
+**Verification (sbatch 2806239, R8 decode_b32 ×3 post-reorder):**
+
+| run | A: our kernel_ms | legacy baseline (diagnostic 2806102) | **diff** |
+|---|---:|---:|---:|
+| 1 | 75.41 µs | 75.23 µs | **+0.18** ✓ |
+| 2 | 76.19 µs | 75.23 µs | **+0.96** ✓ |
+| 3 | 76.45 µs | 75.23 µs | **+1.22** ✓ |
+| **mean** | **76.02 µs** | **75.23 µs** | **+0.79 µs** ← inside noise |
+
+**Bias completely gone** — from +13.5 µs to +0.79 µs.
+
+**Natural-experiment cross-check**: the head-to-head script's B (legacy timer) and C (flashinfer bench_gpu_time) now run AFTER our e2e and pick up the +13 µs pollution that previously hit us (B went 71-77 → 81-90, C went 73-76 → 84-88). **The pollution mechanism is "the measurement after e2e", not engine-specific** — confirmed.
+
+**Impact on other metrics**: R14 / GEMM / CLI end-to-end unaffected — e2e running last only changes "what happened before it"; the metric definition itself is unchanged. 24/24 unit tests still pass.
 
 ### 6.4 GEMM 4Kx4Kx4K fp16 on H100 NVL (cu13 menyu sqsh)
 
@@ -443,16 +465,16 @@ flashinfer-bench run \
 
 ## 7. Follow-ups
 
-### 7.1 Short-term (already done or root-caused)
+### 7.1 Short-term (all done)
 
-- [x] Unit tests: `tests/bench/test_two_mode.py` (commits `41d51ae` + `6228dc0`), **24/24 pass on H100 NVL** (unit_tests_2805991.out)
-- [x] R8 decode_b32 outlier retest → **confirmed systematic** (+13 µs ± 1.5 µs), not noise (sbatch 2805936)
-- [x] Root-cause investigation — diagnostic localized it to FA3 C++ internal state; not addressable from Python (sbatch 2806102, §6.5.1)
+- [x] Unit tests: `tests/bench/test_two_mode.py` (commits `41d51ae` + `6228dc0`), **24/24 pass on H100 NVL**
+- [x] R8 decode_b32 outlier retest → confirmed systematic (+13 µs ± 1.5 µs), not noise (sbatch 2805936)
+- [x] Root-cause investigation — diagnostic localized it to FA3 C++ internal state (sbatch 2806102, §6.3.1)
+- [x] **R8 decode_b32 +13 µs bias FIXED** — commit `8d73f17` reorders phases as kernel_ms → kernel_gpu_ms → e2e, so kernel_ms gets cold state; verified (sbatch 2806239) **A − legacy = +0.79 µs, bias eliminated** (§6.3.2)
 - [x] Real-CUPTI graceful warning: commit `41d51ae` adds `cupti_fallback:cuda_events` status string, no more silent fallback
 
 ### 7.2 Medium-term (separate PR)
 
-- [ ] **R8 decode_b32 +13 µs bias root-cause fix** — localized to FA3 C++ internal state / GPU SM scheduler state; needs process-level reset (IsolatedRunner) or an upstream FA3 reset API. Current workaround: measure decode-heavy big-batch shapes individually, or use `flashinfer-bench run --use-isolated-runner`
 - [ ] `Performance.kernel_ms_per_trial: Optional[List[float]]` — per-trial vectors for outlier analysis
 - [ ] Wire specialized evaluators (sampling / dsa_* / lowbit) to two-mode (v1 silently ignores)
 - [ ] `e2e_reuse_workspace: bool = False` opt-in to skip workspace double-allocation in e2e mode (defaults preserve RFC §8.5)

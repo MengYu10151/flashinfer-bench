@@ -110,8 +110,10 @@ bench_gpu_time_with_cupti(fn=runnable, ..., use_cuda_graph=False)
 | 10 | `41d51ae` | feat+test: 检测 silent CUPTI fallback（新 status `cupti_fallback:cuda_events`）+ unit tests `tests/bench/test_two_mode.py` (250 行, 24/24 pass) |
 | 11 | `6228dc0` | test fix: 替换 `torch.relu(out=)` 为 `torch.add(out=)`（nv24.10 兼容） |
 | 12 | `44905f2` | feat(bench): 加 100 ms cool-down 在三个 metric phase 之间（defensive） |
+| 13 | `a9a6fdd` | docs(rfc): R8 decode_b32 root-cause diagnostic + v3 status string |
+| 14 | `8d73f17` | **fix(bench): 重排测量顺序为 kernel_ms → kernel_gpu_ms → e2e，消除 decode_b32 +13 µs bias** |
 
-Diff size：**+1700 / −60 lines across 20 files**。
+Diff size：**+1830 / −62 lines across 20 files**。
 
 ### 3.2 关键文件
 
@@ -377,13 +379,34 @@ R8 e2e_ms 比 kernel_ms 高 17-42×，因为 R8 `plan()` 包含 Python 循环 + 
 **对外的影响 & 缓解**：
 
 - **PR 可以发**：engine 本身正确，diagnostic 严格证明
-- **已知 limitation**：e2e 之后立刻测的 kernel_ms / kernel_gpu_ms，在 decode-heavy 大 batch shape 上有 ~+13 µs (~15%) 系统性偏移
-- **使用建议**（µs 级精度需求）：
-  - (a) 跑 kernel_ms only / kernel_gpu_ms only —— 不走 e2e
-  - (b) 用 `--use-isolated-runner` 做 process-level isolation（flashinfer-bench 已有这套基础设施）
-- **`_cool_down(device, 0.1)` (commit `44905f2`)** 已加入三个 phase 之间，**但没消掉 decode_b32 偏差**（佐证不是 GPU 热效应）；保留作为 defensive measure for unseen workloads
+- **`_cool_down(device, 0.1)` (commit `44905f2`)** 加入三个 phase 之间，**但没消掉 decode_b32 偏差**（佐证不是 GPU 热效应）；保留作为 defensive measure for unseen workloads
 
 诊断脚本: `/home/scratch.yuny_wwfo/kernel_arena/scripts/62_r8_b32_diag.sh` (+ sbatch 2806102 log)。
+
+#### 6.3.2 真正的 fix：测量顺序重排 (commit `8d73f17`)
+
+既然 root cause 是"e2e 后的下一次测量吃污染"，最简单的 fix 是把 e2e **挪到最后**。新顺序：
+
+```
+kernel_ms → kernel_gpu_ms → e2e   # kernel_ms 拿到 cold FA3 state
+```
+
+e2e 本来就 by definition 吃下所有 wrapper overhead，前面跑过什么对它无所谓。Metric 语义不变，只是哪个 metric "拿干净 state、哪个吃污染" 调换了。
+
+**验证 (sbatch 2806239, R8 decode_b32 ×3)：**
+
+| run | A: 我们 kernel_ms | legacy baseline (diagnostic 2806102) | **diff** |
+|---|---:|---:|---:|
+| 1 | 75.41 µs | 75.23 µs | **+0.18** ✓ |
+| 2 | 76.19 µs | 75.23 µs | **+0.96** ✓ |
+| 3 | 76.45 µs | 75.23 µs | **+1.22** ✓ |
+| **mean** | **76.02 µs** | **75.23 µs** | **+0.79 µs** ← noise 内 |
+
+**Bias 完全消失** —— 从 +13.5 µs → +0.79 µs。
+
+**Natural experiment** 顺带交叉验证根因：head-to-head 脚本里 B (legacy timer) 和 C (fi-bench) 现在反而**跑在我们 e2e 之后**，他们吃到了之前压在我们头上的 +13 µs 污染（B 从 71-77 → 81-90，C 从 73-76 → 84-88）。**污染机制是"e2e 后的下一次测量"，不是 engine-specific** —— 确认无误。
+
+**对其他 metric 的影响**：R14 / GEMM / CLI end-to-end 不受影响 —— e2e 最后跑只改变它"前面发生过什么"，metric 定义本身没变。Unit tests 24/24 still pass。
 
 ### 6.4 GEMM 4Kx4Kx4K fp16 on H100 NVL (cu13 menyu sqsh)
 
@@ -443,16 +466,16 @@ flashinfer-bench run \
 
 ## 7. 接下来 / 未完事项
 
-### 7.1 短期（已完成或定位）
+### 7.1 短期（全部完成）
 
-- [x] tests: `tests/bench/test_two_mode.py` 单元化（commit `41d51ae` + `6228dc0`），**24/24 pass on H100 NVL**（unit_tests_2805991.out）
-- [x] R8 decode_b32 outlier 复测 → **确认是系统性偏差** (+13 µs ± 1.5 µs)，不是 noise (sbatch 2805936)
-- [x] 根因调查 — diagnostic 锁定 FA3 C++ 内部 state，Python 层不可清 (sbatch 2806102, §6.5.1)
+- [x] tests: `tests/bench/test_two_mode.py` 单元化（commit `41d51ae` + `6228dc0`），**24/24 pass on H100 NVL**
+- [x] R8 decode_b32 outlier 复测 → 确认是系统性偏差 (+13 µs ± 1.5 µs)，不是 noise (sbatch 2805936)
+- [x] 根因调查 — diagnostic 锁定到 FA3 C++ 内部 state，Python 层不可清 (sbatch 2806102, §6.3.1)
+- [x] **R8 decode_b32 +13 µs bias 修复** — commit `8d73f17` 重排测量顺序为 kernel_ms → kernel_gpu_ms → e2e，让 kernel_ms 拿 cold state；验证 (sbatch 2806239) **A−legacy = +0.79 µs，bias 完全消失** (§6.3.2)
 - [x] 真 CUPTI graceful warning：commit `41d51ae` 加 `cupti_fallback:cuda_events` status string，不再静默 fallback
 
 ### 7.2 中期（独立 PR）
 
-- [ ] **R8 decode_b32 +13 µs bias root cause** —— 已确认在 FA3 C++ 层 / GPU SM scheduler state；fix 需要 process-level reset（IsolatedRunner 等），或上游 FA3 提供 reset API。当前 work-around：对 decode-heavy 大 batch shape，单独跑 `_measure_kernel_cudagraph` (不走 e2e)，或者用 `flashinfer-bench run --use-isolated-runner`
 - [ ] `Performance.kernel_ms_per_trial: Optional[List[float]]` —— per-trial vectors，方便 outlier 分析
 - [ ] specialized evaluator（sampling/dsa_*/lowbit）接 two-mode（v1 静默忽略）
 - [ ] `e2e_reuse_workspace: bool = False` —— 给 e2e mode 一个 opt-in 旋钮跳过 workspace 双重分配（默认还是按 RFC §8.5 重跑）
