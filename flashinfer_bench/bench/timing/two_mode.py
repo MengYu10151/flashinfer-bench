@@ -20,6 +20,7 @@ decisions (Q1-Q6 in §8).
 from __future__ import annotations
 
 import statistics
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, List, Tuple
 
@@ -45,7 +46,14 @@ class ThreeMetrics:
     kernel_ms: float
     kernel_gpu_ms: float
     kernel_ms_status: str
+    """``"ok"`` | ``"fallback_eager:<Exception>"`` (cudagraph capture failed)."""
     kernel_gpu_ms_status: str
+    """``"ok"`` | ``"no_cupti:<Exception>"`` (cupti-python not importable) |
+    ``"cupti_no_samples"`` (CUPTI returned an empty list) |
+    ``"cupti_fallback:cuda_events"`` (cupti-python installed but the library
+    was unusable — e.g. cu12 container with cupti-python 13.x — and flashinfer
+    silently fell back to CUDA events; numbers are still valid but no longer a
+    CUPTI activity sum)."""
 
 
 def time_runnable_two_mode(
@@ -206,17 +214,31 @@ def _measure_kernel_gpu_cupti(
     span-vs-sum issues.
     """
     runnable.setup_for_workload(*args)
-    try:
-        times = bench_gpu_time_with_cupti(
-            fn=runnable,
-            dry_run_iters=warmup,
-            repeat_iters=iters,
-            input_args=tuple(args),
-            cold_l2_cache=True,
-            use_cuda_graph=False,
-        )
-    except Exception as ex:
-        return 0.0, f"no_cupti:{type(ex).__name__}"
+    # Capture warnings so we can detect flashinfer's internal CUPTI-fallback
+    # path (it raises a UserWarning saying "CUPTI is not installed" /
+    # "needs to be >= X.X.X" and silently switches to CUDA events). Without
+    # this we'd report status="ok" while actually returning CUDA-event numbers,
+    # which hides the fact that kernel_gpu_ms is no longer a CUPTI activity
+    # sum. Surface that via status="cupti_fallback:cuda_events".
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            times = bench_gpu_time_with_cupti(
+                fn=runnable,
+                dry_run_iters=warmup,
+                repeat_iters=iters,
+                input_args=tuple(args),
+                cold_l2_cache=True,
+                use_cuda_graph=False,
+            )
+        except Exception as ex:
+            return 0.0, f"no_cupti:{type(ex).__name__}"
     if not times:
         return 0.0, "cupti_no_samples"
+    for w in caught:
+        msg = str(w.message).lower()
+        if "cupti" in msg and (
+            "falling back" in msg or "not installed" in msg or "needs to be" in msg
+        ):
+            return statistics.median(times), "cupti_fallback:cuda_events"
     return statistics.median(times), "ok"
