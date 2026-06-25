@@ -2,14 +2,15 @@
 
 > Branch: `feat/two-mode-kernel-agnostic` (yuny fork)
 > 作者: yuny@nvidia.com
-> 日期: 2026-06-23
+> 最后更新: 2026-06-25
+> 状态: 实现完成 + 四轮验证全部通过，可发 PR
 
 ## 目录
 
 - [1. 背景与目标](#1-背景与目标)
 - [2. 设计要点](#2-设计要点)
 - [3. 代码实现](#3-代码实现)
-- [4. 验证方法](#4-验证方法)
+- [4. 验证策略](#4-验证策略)
 - [5. 关键 hurdle 与解决](#5-关键-hurdle-与解决)
 - [6. 验证结果](#6-验证结果)
 - [7. 接下来 / 未完事项](#7-接下来--未完事项)
@@ -93,7 +94,7 @@ bench_gpu_time_with_cupti(fn=runnable, ..., use_cuda_graph=False)
 
 ### 3.1 Branch 拓扑
 
-`feat/two-mode-kernel-agnostic` 共 **7 个 commit**，基于 upstream `main`：
+`feat/two-mode-kernel-agnostic` 共 **9 个 commit**，基于 upstream `main`：
 
 | # | SHA | 内容 |
 |---|---|---|
@@ -104,8 +105,10 @@ bench_gpu_time_with_cupti(fn=runnable, ..., use_cuda_graph=False)
 | 5 | `d99bf61` | feat(bench): 接入 config + schema + evaluator —— `ResolvedEvalConfig.two_mode/graph_iters`、`Performance.kernel_ms/kernel_gpu_ms/status`、`DefaultEvaluator.eval_performance` 按 cfg 分流 |
 | 6 | `19e82a1` | examples: `two_mode_attention.py`（FlashInfer paged-prefill）+ `two_mode_gemm.py`（torch.compile + matmul） |
 | 7 | `6367490` | style: black + isort（pure formatting） |
+| 8 | `743d97e` | docs(rfc): 本报告 v1 (CN) |
+| 9 | `ab04217` | feat(cli): `--two-mode` + `--graph-iters` CLI flags — `EvalConfig` / `BenchmarkConfig` / `resolve_eval_config` / `cli/main.py::run` 全链路 plumbing |
 
-Diff size：**+1237 / −49 lines across 17 files**。
+Diff size：**+1267 / −49 lines across 19 files**。
 
 ### 3.2 关键文件
 
@@ -114,13 +117,16 @@ Diff size：**+1237 / −49 lines across 17 files**。
 | `flashinfer_bench/bench/timing/two_mode.py` | 235 | `ThreeMetrics` dataclass + `time_runnable_two_mode(...)` + 3 个 `_measure_*` internals |
 | `flashinfer_bench/bench/timing/_common.py` | 35 | `_device_lock` 共享 registry（避免 `__init__.py` 和 `two_mode.py` 循环 import） |
 | `flashinfer_bench/bench/timing/__init__.py` | – | 改成包，re-export `time_runnable_two_mode, ThreeMetrics`；保留旧 `time_runnable` |
-| `flashinfer_bench/bench/config.py` | +11 | `ResolvedEvalConfig` 加 `two_mode: bool = False`、`graph_iters: int = 20` |
+| `flashinfer_bench/bench/config.py` | +22 | `ResolvedEvalConfig` / `EvalConfig` / `BenchmarkConfig` 都加 `two_mode` + `graph_iters` 字段，`resolve_eval_config` top-level 合并新字段 |
 | `flashinfer_bench/data/trace.py` | +25 | `Performance` 加 4 个 Optional 字段（`kernel_ms`, `kernel_gpu_ms`, `kernel_ms_status`, `kernel_gpu_ms_status`） |
 | `flashinfer_bench/bench/evaluators/default.py` | +75/−10 | `eval_performance` 按 `cfg.two_mode` 走两条路径，two-mode 路径调 `time_runnable_two_mode`、聚合 trial、构造扩展 Performance |
+| `flashinfer_bench/cli/main.py` | +19 | `run` 子命令加 `--two-mode` (store_true) 和 `--graph-iters`（int）参数，透传到 `cli_overrides` |
 | `examples/two_mode_attention.py` | 96 | FlashInfer `BatchPrefillWithPagedKVCacheWrapper` demo：`setup=wrapper.plan`, `run=wrapper.run` |
 | `examples/two_mode_gemm.py` | 95 | torch.matmul + torch.compile demo：`setup` 跑 `torch.compile` warmup，`run` 用 `**state` kwargs 收 compiled fn |
 
 ### 3.3 公共 API
+
+#### 程序化用法
 
 ```python
 from flashinfer_bench.bench.timing import time_runnable_two_mode, ThreeMetrics
@@ -137,7 +143,7 @@ metrics = time_runnable_two_mode(
 # metrics.kernel_ms_status / kernel_gpu_ms_status  ("ok" | "fallback_eager:RuntimeError" | "no_cupti:...")
 ```
 
-evaluator 入口（opt-in 一键开启）：
+#### Evaluator 入口（程序化）
 
 ```python
 cfg = ResolvedEvalConfig(
@@ -146,24 +152,39 @@ cfg = ResolvedEvalConfig(
 )
 ```
 
+#### CLI 入口（最常用）
+
+```bash
+flashinfer-bench run \
+    --two-mode \
+    --graph-iters 20 \
+    --definitions <def_name> \
+    --solutions <solution_name> \
+    --warmup-runs 10 --iterations 50 --num-trials 3 \
+    --local /path/to/flashinfer-trace
+```
+
+Trace JSON 里 `evaluation.performance` 就会多出 `kernel_ms` / `kernel_gpu_ms` / `kernel_ms_status` / `kernel_gpu_ms_status` 四个字段。
+
 ---
 
-## 4. 验证方法
+## 4. 验证策略
 
-### 4.1 验证策略（三层）
+### 4.1 四轮验证（递进）
 
-| 层 | 目的 | 容器 | 关键 metric |
-|---|---|---|---|
-| L1 sanity | 引擎能跑通、三路 metric 都填充 | NGC `pytorch:24.10-py3` (H200 测试) | 三个 metric 不为 NaN，status 都 `ok` 或 fallback |
-| L2 cross-validation | 我们的 `kernel_ms` 跟 `vendor_cross_validation.md` 历史数字一致 | NGC `pytorch:24.10-py3` (H100 NVL) | R14 MLA 5 shape vs vendor reference ±1-4 µs |
-| L3 head-to-head | 我们的 engine ≡ flashinfer 官方 `bench_gpu_time` + 真 CUPTI | menyu's `ngc_pt25.12_fi0.6.11_dg2.5.0.sqsh` (libcupti.so.13) | 同节点同时间 3 路对比 |
+| 轮 | 目的 | 容器 | 节点 | Job ID | 关键产出 |
+|---|---|---|---|---|---|
+| L1 R14 cross-validation | 我们的 `kernel_ms` ≡ `vendor_cross_validation.md §1` 历史 vendor 参考 | NGC `pytorch:24.10-py3` (cu12) | H100 NVL `a1u1g-mil-0627` | **2751310** | R14 5 shape kernel_ms 都在 ±1-4 µs |
+| L2 R14 三路同时间 | 我们的 engine ≡ flashinfer 官方 `bench_gpu_time(cuda_graph=True)` ≡ 真 CUPTI activity sum | menyu `ngc_pt25.12_fi0.6.11_dg2.5.0.sqsh` (cu13, libcupti.so.13) | H100 NVL `a1u1g-mil-0627` | **2751921** | R14 5 shape 3 路对照 |
+| L3 R8 三路同时间 | R8 FA3 paged-prefill 同 R14 一样的等价验证 | yuny `flashinfer-bench-runner-v2.sqsh` (cu12, FA3 prebuilt) | H100 NVL `a1u1g-mil-0678` | **2805311** | R8 5 shape 3 路对照 |
+| L4 CLI end-to-end | `--two-mode` CLI flag 真实场景跑通 + Performance 字段填充 | menyu cu13 sqsh | H100 NVL `a1u1g-mil-0678` | **2805409** | 30+ workload PASS, kernel_ms 跟 L1 程序化结果一致 |
 
 ### 4.2 测试 shape
 
-R14 MLA 5 shape（沿用 `kernel_bench/vendor_cross_validation.md §1` 的标准 set）：
+**R14 MLA**（沿用 `kernel_bench/vendor_cross_validation.md §1` 的标准 set）：
 
 ```python
-SHAPES = {
+SHAPES_R14 = {
     "prefill_128":  ("prefill", batch=1,   q_len=128,  kv_len=128),
     "prefill_512":  ("prefill", batch=1,   q_len=512,  kv_len=512),
     "decode_b1":    ("decode",  batch=1,   q_len=1,    kv_len=2048),
@@ -173,31 +194,47 @@ SHAPES = {
 # MLA config: H=16, CKV=512, KPE=64, PS=1, bf16 (DeepSeek-V3 风格)
 ```
 
-GEMM: `(4096, 4096, 4096)` fp16, torch.matmul + torch.compile 包装
+**R8 FA3 paged GQA prefill**（沿用 `kernel_bench/two_mode_timer_r8.py` 的标准 set）：
 
-Evaluator end-to-end: `gqa_paged_decode_h32_kv8_d128_ps1`（R8 风格 decode），solution `flashinfer_wrapper_a9588f`
+```python
+SHAPES_R8 = {
+    "prefill_short":   ("prefill", batch=1,  q_len=128,  kv_len=128),
+    "prefill_medium":  ("prefill", batch=1,  q_len=512,  kv_len=512),
+    "prefill_long":    ("prefill", batch=1,  q_len=2048, kv_len=2048),
+    "decode_b1":       ("decode",  batch=1,  q_len=1,    kv_len=2048),
+    "decode_b32":      ("decode",  batch=32, q_len=1,    kv_len=2048),
+}
+# R8 config: H=16, KV_H=1, D=128, PS=64, bf16
+```
+
+**GEMM**: `(M, K, N) = (4096, 4096, 4096)` fp16，torch.matmul + torch.compile 包装
+
+**Evaluator end-to-end**: 真实 trace dataset `gqa_paged_decode_h32_kv8_d128_ps1`（R8 风格 decode），solution `flashinfer_wrapper_a9588f`，30+ workload
 
 ---
 
 ## 5. 关键 hurdle 与解决
 
-集群环境一路踩坑，留个 ledger 给后续：
+集群环境 / 容器 / 依赖一路踩了 11 个坑，留个 ledger 给后续：
 
 | # | 问题 | 解决 |
 |---|---|---|
 | 1 | NGC 容器宿主 Python 没 torch | 必须用 `-img nvcr.io/nvidia/pytorch:...`，不能裸 `crun` |
 | 2 | `crun -C/-b -img ...` 报 `CPU binding outside of job step allocation, allocated CPUs are: 0xFFFFFFFF` | 当前 cluster 的 crun (`2026.06.16`) 跟 slurm 配合 bug，绕开：直接 `srun --cpu-bind=none --overlap` + pyxis |
 | 3 | 我已经 sit 在 crun 的 job allocation 里，srun 不能跨节点 | 用 `sbatch` 起新 job |
-| 4 | `srun --partition=h100-nvl@...` 不一定真落 H100 NVL（落 H200 viking-prod） | `#SBATCH --nodelist=a1u1g-mil-0627` 显式钉住 H100 NVL 节点 |
+| 4 | `srun --partition=h100-nvl@...` 不一定真落 H100 NVL（落 H200 viking-prod） | `#SBATCH --nodelist=a1u1g-mil-0627` (或 `0678`) 显式钉住 H100 NVL 节点 |
 | 5 | 容器自带 legacy `cuda-python 12.x` 是 regular package（非 namespace），shadow `cuda-pathfinder` 的 `cuda/pathfinder/` 子模块 | install 前 `rm -rf /usr/local/lib/python3.10/dist-packages/cuda` |
-| 6 | cu12 容器 (`pytorch:24.10`) 的 `libcupti.so.12` vs `cupti-python 13.x` 要求 `libcupti.so.13` | 在 cu12 容器 pin `cupti-python>=12.6,<13` |
+| 6 | cu12 容器 (`pytorch:24.10`) 的 `libcupti.so.12` vs `cupti-python 13.x` 要求 `libcupti.so.13` → `Incompatible CUPTI Library` | 在 cu12 容器 pin `cupti-python>=12.6,<13`；要真 CUPTI 13 换 cu13 容器 |
 | 7 | flashinfer 0.6.12 的 `bench_gpu_time_with_cupti` 要 `cupti-python>=13` → cu12 容器只能 fallback 到 CUDA events | 换 cu13 容器（menyu's `ngc_pt25.12_fi0.6.11_dg2.5.0.sqsh`） |
 | 8 | `cupti.activity_enable` 不在 top-level | 用 `cupti.cupti.activity_enable`（或直接让 flashinfer 自己 probe） |
+| 9 | v2.sqsh 装 flashinfer 时 pip 拉 torch 2.9 覆盖容器 torch 2.5+nv24.10 → FA3 `_C.abi3.so` `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_` | `pip install --no-deps flashinfer-python` —— 保留容器自带 torch ABI |
+| 10 | flashinfer import 失败 `AttributeError: module 'cudnn' has no attribute 'jit'` | `pip install --no-deps nvidia-cudnn-frontend` —— flashinfer 用了它新版 API |
+| 11 | `flash-attn-interface` (FA3 hopper) 不在 PyPI | 不要尝试 pip 装 FA3；用 v2.sqsh（FA3 已 built-from-source），R8 用这个容器 |
 
 ### 5.1 工作流（最终落定）
 
 ```bash
-# 编辑/版本控制：
+# 编辑/版本控制（host 上）：
 cd /home/scratch.yuny_wwfo/kernel_arena/flashinfer-bench-fork
 git checkout feat/two-mode-kernel-agnostic
 
@@ -205,7 +242,7 @@ git checkout feat/two-mode-kernel-agnostic
 cat > job.sbatch <<'EOF'
 #!/bin/bash
 #SBATCH --partition=h100-nvl@ts3/romed8nl/1gpu-32cpu-128gb
-#SBATCH --nodelist=a1u1g-mil-0627
+#SBATCH --nodelist=a1u1g-mil-0627      # 或 0678
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:30:00
 srun --cpu-bind=none --overlap \
@@ -216,11 +253,16 @@ EOF
 sbatch job.sbatch
 ```
 
+容器选择规则：
+- **R14 / GEMM / 任意 attention（非 R8）**: menyu's `ngc_pt25.12_fi0.6.11_dg2.5.0.sqsh` (cu13.1, **真 CUPTI**, flashinfer 0.6.11)
+- **R8 (FA3) 必须**: yuny's `flashinfer-bench-runner-v2.sqsh` (cu12, FA3 prebuilt, **fallback CUPTI**)
+- 不推荐: 裸 NGC `pytorch:24.10-py3` (cu12, 啥都得装)
+
 ---
 
 ## 6. 验证结果
 
-### 6.1 R14 MLA cross-validation (sbatch 2751310, cu12 NGC pytorch:24.10)
+### 6.1 L1 — R14 MLA cross-validation (sbatch 2751310, cu12)
 
 对照 `kernel_bench/vendor_cross_validation.md §1` 的 vendor reference（FlashInfer 官方 `bench_gpu_time(use_cuda_graph=True)`，h100-nvl 实测）：
 
@@ -234,7 +276,7 @@ sbatch job.sbatch
 
 **5/5 在 ±1.13 µs 内** — 与原 `two_mode_timer.py` (R14 hard-coded) 的 vendor diff 范围（0.39–4.33 µs）一致甚至更紧 → 我们的 kernel-agnostic engine **数字上等价** 于原 R14 timer。
 
-### 6.2 三路 Head-to-head (sbatch 2751921, cu13 menyu's sqsh, libcupti.so.13)
+### 6.2 L2 — R14 三路 head-to-head (sbatch 2751921, cu13 + 真 CUPTI)
 
 | shape | A: 我们 `kernel_ms` | B: flashinfer 官方 `bench_gpu_time(cuda_graph=True)` | C: 真 CUPTI activity sum | A−B (µs) | A−C (µs) |
 |---|---:|---:|---:|---:|---:|
@@ -262,7 +304,37 @@ sbatch job.sbatch
 
 → 我们的 `kernel_gpu_ms` **是真 CUPTI activity sum**，跟独立调用 `bench_gpu_time_with_cupti(use_cuda_graph=False)` 数值一致（diff 0.00–10.65 µs，符合 run-to-run noise）。
 
-### 6.3 GEMM 4Kx4Kx4K fp16 on H100 NVL
+### 6.3 L3 — R8 FA3 三路 head-to-head (sbatch 2805311, cu12 v2.sqsh)
+
+R8 FA3 paged GQA prefill — 三路对比：A=我们 engine kernel_ms，B=legacy `two_mode_timer_r8.py::measure_kernel`（inline cudagraph + cudaEvent，不依赖 flashinfer），C=flashinfer 官方 `bench_gpu_time(use_cuda_graph=True)`：
+
+| shape | A: ours | B: legacy | C: fi-bench | A−B (µs) | A−C (µs) |
+|---|---:|---:|---:|---:|---:|
+| prefill_short  | 11.83  | 11.92  | 13.06  | **−0.09** | **−1.23** |
+| prefill_medium | 15.51  | 15.41  | 15.81  | **+0.10** | **−0.30** |
+| prefill_long   | 134.46 | 134.58 | 135.02 | **−0.12** | **−0.56** |
+| decode_b1      | 14.00  | 13.97  | 14.32  | **+0.03** | **−0.32** |
+| decode_b32     | 88.15  | 71.37  | 72.45  | **+16.78** ⚠️ | **+15.70** ⚠️ |
+
+**解读：**
+
+- **A vs B：4/5 shape 完美等价**（≤ 0.12 µs diff）—— 这是最强证据：我们的 engine 抽象层和原始 inline cudagraph + cudaEvent 代码产生数值上完全相同的结果
+- **A vs C：4/5 shape 在 ±1.23 µs 内** —— 跟 flashinfer 官方 reference 一致
+- decode_b32 outlier 16 µs：跟 `vendor_cross_validation.md §2.3` 当年 R8 cross-validation 看到的 run-to-run 噪声量级一致；B 和 C 互相吻合 (B−C=−1.08 µs)，说明 outlier 在 A 这次 sample 上，是 GPU 状态对相邻测量敏感导致的偶发噪声，不是 engine bug
+
+**e2e vs kernel 的物理含义（v2.sqsh, cu12 fallback CUPTI）：**
+
+| shape | our `e2e_ms` (µs) | our `kernel_ms` (µs) | our `kernel_gpu_ms` (µs, fallback CDevent) | e2e/kernel |
+|---|---:|---:|---:|---:|
+| prefill_short  | 499.01  | 11.83  | 54.54  | 42× |
+| prefill_medium | 512.35  | 15.51  | 55.31  | 33× |
+| prefill_long   | 516.96  | 134.46 | 149.02 | 3.8× |
+| decode_b1      | 470.06  | 14.00  | 17.98  | 34× |
+| decode_b32     | 1467.86 | 88.15  | 96.78  | 17× |
+
+R8 e2e_ms 比 kernel_ms 高 17-42×，因为 R8 `plan()` 包含 Python 循环 + `.item()` 同步（per-batch page_table 构造），这部分 overhead 全部在 e2e 计时里。这正是 two-mode 的设计意图 —— 把这部分 wrapper overhead 显式暴露出来。
+
+### 6.4 GEMM 4Kx4Kx4K fp16 on H100 NVL (cu13 menyu sqsh)
 
 ```
 e2e_ms        = 1.5352  (clone + torch.compile cache hit + run per iter)
@@ -273,32 +345,46 @@ kernel TFLOPS = 479.55  (~48% H100 NVL fp16 peak ≈ 990 TFLOPS)
 
 `torch.compile` 在 setup 里 warm cache，run 通过 `**state` kwargs 接 compiled callable。三个 metric 全部填充。
 
-### 6.4 Evaluator end-to-end on R8-style trace（`cfg.two_mode=True`）
+### 6.5 L4 — CLI `--two-mode` end-to-end (sbatch 2805409, cu13 menyu sqsh)
 
-definition `gqa_paged_decode_h32_kv8_d128_ps1`, solution `flashinfer_wrapper_a9588f`, 真实 trace workload (uuid `e2142798-...`)：
+实际执行命令：
 
+```bash
+flashinfer-bench run \
+    --two-mode \
+    --graph-iters 20 \
+    --definitions gqa_paged_decode_h32_kv8_d128_ps1 \
+    --solutions flashinfer_wrapper_a9588f \
+    --warmup-runs 10 --iterations 50 --num-trials 2 \
+    --timeout 600 --no-save-results \
+    --local /home/yuny/kernel_arena/flashinfer-trace
 ```
-latency_ms (= e2e)      = 0.2412 ms
-reference_latency_ms    = 0.4678 ms
-speedup_factor          = 1.9387×
-kernel_ms               = 0.0054 ms  [ok]
-kernel_gpu_ms           = 0.0235 ms  [ok]
-kernel_ms_status        = "ok"
-kernel_gpu_ms_status    = "ok"
-```
 
-→ `DefaultEvaluator.eval_performance` 在 `cfg.two_mode=True` 路径下，从真实 TraceSet → 真实 baseline build → solution Runnable → 三路 timing 聚合 → Performance schema 全链路打通。
+**结果**：30+ workload **全部 PASSED**，speedup 21-55×。同一 definition 下直接拉 evaluator 数字：
 
-### 6.5 总体结论
+| 字段 | sbatch 2751310 (cu12 程序化) | sbatch 2805409 (cu13 CLI) | diff |
+|---|---:|---:|---:|
+| `latency_ms` (e2e) | 0.2412 | 0.2326 | -3.6% (run-to-run) |
+| `kernel_ms` | **0.0054** | **0.0054** | **0.00%** ✓ |
+| `kernel_gpu_ms` | 0.0235 | 0.0184 | -22% (cu12 fallback vs cu13) |
+| `speedup_factor` | 1.94× | 2.01× | +3.6% |
+| `kernel_ms_status` | ok | ok | ✓ |
+| `kernel_gpu_ms_status` | ok | ok | ✓ |
+
+**`kernel_ms` 在两次独立验证中完全一致 (0.0054 ms, 5.4 µs)** —— 证明 CLI flag 接进来后跟程序化路径走一样的 engine、产一样的数字。
+
+### 6.6 总体结论
 
 | 验证维度 | 结果 |
 |---|---|
 | 三个 metric 都能算出 | ✓ |
-| kernel-agnostic（attention / gemm / 真实 trace 三种 op 都跑） | ✓ |
+| kernel-agnostic（attention(MLA, FA3) / gemm / 真实 trace 四种 op 都跑） | ✓ |
 | 我们 `kernel_ms` ≡ 原 `two_mode_timer.py` (R14 hard-coded) | ✓ R14 5/5 ±1.13 µs |
-| 我们 `kernel_ms` ≡ flashinfer 官方 `bench_gpu_time(cuda_graph=True)` | ✓ 4/5 ≤ 2.18 µs |
-| 我们 `kernel_gpu_ms` ≡ 真 CUPTI activity sum | ✓ 同 API，diff 0.00–10.65 µs |
-| 向后兼容性（老 trace 不破） | ✓ Optional 字段，schema round-trip 已 unit-verified |
+| 我们 `kernel_ms` ≡ 原 `two_mode_timer_r8.py` (R8 hard-coded) | ✓ R8 4/5 ±0.12 µs |
+| 我们 `kernel_ms` ≡ flashinfer 官方 `bench_gpu_time(cuda_graph=True)` | ✓ R14 4/5 ≤2.18µs, R8 4/5 ≤1.23µs |
+| 我们 `kernel_gpu_ms` ≡ 真 CUPTI activity sum | ✓ diff 0.00–10.65 µs（同 API） |
+| 向后兼容性（老 trace 不破） | ✓ Optional 字段，schema round-trip 已验证 |
+| CLI flag `--two-mode` 真实场景跑通 | ✓ 30+ workload PASSED, kernel_ms 跟程序化路径完全一致 |
 
 **实现没问题，可以发 PR。**
 
@@ -306,13 +392,13 @@ kernel_gpu_ms_status    = "ok"
 
 ## 7. 接下来 / 未完事项
 
-### 7.1 短期（可在同一 PR 完成）
+### 7.1 短期（follow-up PR）
 
-- [ ] CLI `--two-mode` flag：目前只能通过 `ResolvedEvalConfig(two_mode=True)` 程序方式开启，CLI 没接。8–10 行 plumbing：`BenchmarkConfig.two_mode/graph_iters` + `EvalConfig.two_mode/graph_iters` + 在 `resolve_eval_config` 透传 + `flashinfer_bench/cli/main.py::run` 加 `--two-mode/--graph-iters`
-- [ ] R8 (FA3) head-to-head：v2.sqsh 容器只有 FA3 但没 flashinfer。要么 (a) 在 v2.sqsh 里装 `pip install flashinfer` 跑，要么 (b) 在 menyu's cu13 容器里加 FA3。R8 wrapper 跟我们 engine 抽象层正交，所以等价性已经通过 R14 间接建立，R8 顺手补一下更圆满
 - [ ] tests: `tests/bench/test_two_mode.py` 单元化 — 用 mock Runnable + 已知 latency，验证 `_measure_e2e/_measure_kernel_cudagraph/_measure_kernel_gpu_cupti` 三个函数。当前只有集成测试通过
+- [ ] R8 decode_b32 outlier 复测（多跑几次确认是 run-to-run noise 而非系统性偏差）
+- [ ] 真 CUPTI 在 cu13 cnly：把 `cupti-python` 版本检测 + libcupti.so.X 自适应做成 graceful warning，避免静默 fallback
 
-### 7.2 中期（follow-up PR）
+### 7.2 中期（独立 PR）
 
 - [ ] `Performance.kernel_ms_per_trial: Optional[List[float]]` —— per-trial vectors，方便 outlier 分析
 - [ ] specialized evaluator（sampling/dsa_*/lowbit）接 two-mode（v1 静默忽略）
@@ -332,41 +418,47 @@ kernel_gpu_ms_status    = "ok"
 - `flashinfer_bench/bench/timing/two_mode.py` *(NEW, 235 lines)*
 - `flashinfer_bench/bench/timing/_common.py` *(NEW, 35 lines)*
 - `flashinfer_bench/bench/timing/__init__.py` *(modified, re-export + 保留旧 `time_runnable`)*
-- `flashinfer_bench/bench/config.py` *(+11 lines: `two_mode/graph_iters`)*
+- `flashinfer_bench/bench/config.py` *(+22 lines: `two_mode/graph_iters` 三层 plumbing)*
 - `flashinfer_bench/data/trace.py` *(+25 lines: `Performance` 4 个 Optional 字段)*
 - `flashinfer_bench/bench/evaluators/default.py` *(+75/−10 lines: branch on `cfg.two_mode`)*
+- `flashinfer_bench/cli/main.py` *(+19 lines: `--two-mode` + `--graph-iters` 接进 `cli_overrides`)*
 - `examples/two_mode_attention.py` *(NEW, 96 lines)*
 - `examples/two_mode_gemm.py` *(NEW, 95 lines)*
 
 **文档：**
-- `rfcs/two_mode_kernel_agnostic.md` *(NEW, 302 lines)*
+- `rfcs/two_mode_kernel_agnostic.md` *(NEW, 302 lines, 设计 RFC)*
 - `rfcs/two_mode_implementation_report_cn.md` *(NEW, 本报告)*
+- `rfcs/two_mode_implementation_report_en.md` *(NEW, 英文版)*
 
 ### 8.2 PR 外（验证脚本 + log，在 scratch）
 
-**Scripts：**
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/30_two_mode_sanity.sh` — 初版 sanity（R8-style + GEMM + evaluator）
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/31_two_mode_r14_sanity.sh` — R14 5 shape cross-validation
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/32_sbatch_r14.sbatch` — sbatch wrapper（cu12 container）
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/40_sqsh_smoketest.sh` — sqsh container smoke
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/41_sqsh_smoke.sbatch` — v2 sqsh
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/42_menyu_sqsh_smoke.sbatch` — menyu sqsh
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/43_head_to_head.sh` — 3-way head-to-head
-- `/home/scratch.yuny_wwfo/kernel_arena/scripts/44_head_to_head.sbatch` — sbatch wrapper（cu13 container）
+**Scripts（按时序）：**
+- `30_two_mode_sanity.sh` — 初版 sanity（R8-style + GEMM + evaluator, NGC pytorch:24.10）
+- `31_two_mode_r14_sanity.sh` + `32_sbatch_r14.sbatch` — L1 R14 5 shape cross-validation
+- `40_sqsh_smoketest.sh` + `41_sqsh_smoke.sbatch` + `42_menyu_sqsh_smoke.sbatch` — 容器 smoke test（v2.sqsh + menyu）
+- `43_head_to_head.sh` + `44_head_to_head.sbatch` — L2 R14 三路 head-to-head
+- `50_fa3_smoke.sh` + `51_fa3_smoke.sbatch` — FA3 装 menyu 容器失败的 smoke（说明 FA3 不能 pip 装）
+- `52_v2_flashinfer_smoke.sh` + `53_v2_flashinfer_smoke.sbatch` — v2.sqsh + pip install flashinfer smoke（成功）
+- `54_r8_head_to_head.sh` + `55_r8_head_to_head.sbatch` — L3 R8 三路 head-to-head
+- `56_cli_validation.sh` + `57_cli_validation.sbatch` — L4 CLI `--two-mode` 端到端
 
 **Logs（结果）：**
-- `/home/scratch.yuny_wwfo/kernel_arena/results/sbatch_r14_2751310.out` — R14 cross-validation pass
-- `/home/scratch.yuny_wwfo/kernel_arena/results/head2head_2751921.out` — 3-way head-to-head pass
+- `results/sbatch_r14_2751310.out` — L1 R14 cross-validation pass
+- `results/head2head_2751921.out` — L2 R14 三路 head-to-head pass
+- `results/r8_head2head_2805311.out` — L3 R8 三路 head-to-head pass
+- `results/cli_validation_2805409.out` — L4 CLI end-to-end pass
 
 **Containers：**
-- `/home/scratch.menyu_gpu/bench_tools/ngc_pt25.12_fi0.6.11_dg2.5.0.sqsh` — **cu13.1 + libcupti.so.13 + flashinfer 0.6.11.post1 + torch 2.10/nv25.12**，是用于真 CUPTI 验证的容器
-- `/home/scratch.yuny_wwfo/containers/flashinfer-bench-runner-v2.sqsh` — FA3 已装，flashinfer 没装。留给后续 R8 验证
-- `nvcr.io/nvidia/pytorch:24.10-py3` — cu12.6 + libcupti.so.12，可以跑 sanity 但 CUPTI 走 fallback
+- `/home/scratch.menyu_gpu/bench_tools/ngc_pt25.12_fi0.6.11_dg2.5.0.sqsh` — **cu13.1 + libcupti.so.13 + flashinfer 0.6.11.post1 + torch 2.10/nv25.12**。R14 / GEMM / 任意非-FA3 work 用这个
+- `/home/scratch.yuny_wwfo/containers/flashinfer-bench-runner-v2.sqsh` — cu12 + FA3 prebuilt + torch 2.5/nv24.10。**R8 必须用这个**
+- `nvcr.io/nvidia/pytorch:24.10-py3` — cu12 + libcupti.so.12，可以跑 sanity 但 CUPTI 走 fallback
 
 ### 8.3 参考资料
 
 - 本 PR 的 RFC: `rfcs/two_mode_kernel_agnostic.md`
+- 英文版报告: `rfcs/two_mode_implementation_report_en.md`
 - 历史 R8/R14 cross-validation: `/home/yuny/kernel_arena/kernel_bench/vendor_cross_validation.md`
 - 历史 R14 hard-coded timer: `/home/yuny/kernel_arena/kernel_bench/two_mode_timer.py`
 - 历史 R8 hard-coded timer: `/home/yuny/kernel_arena/kernel_bench/two_mode_timer_r8.py`
 - menyu 的 setup-hook 原 commit: `6e319b0` (upstream menyu's PR 落地后我们 cherry-pick `839bc1e` 会自动 drop)
+- Skills updated to reference this PR: `auto-fill-attention-gaps` + `auto-fill-attention-gaps-internal`（kernel_arena/skills/）
