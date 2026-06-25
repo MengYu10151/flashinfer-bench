@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flashinfer_bench.bench.config import BenchmarkConfig
+from flashinfer_bench.bench.config import BenchmarkConfig, ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators import (
     DsaSparseAttentionEvaluator,
     DsaTopkIndexerEvaluator,
@@ -219,7 +219,7 @@ def test_correct(tmp_path, tmp_cache_dir):
     solution = _make_solution("correct", _REFERENCE_CODE)
     registry = BuilderRegistry.get_instance()
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaTopkIndexerEvaluator.check_correctness(
         definition=definition,
@@ -252,7 +252,7 @@ def test_shuffled(tmp_path, tmp_cache_dir):
     solution = _make_solution("shuffled", shuffle_code)
     registry = BuilderRegistry.get_instance()
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaTopkIndexerEvaluator.check_correctness(
         definition=definition,
@@ -288,7 +288,7 @@ def test_wrong(tmp_path, tmp_cache_dir):
     solution = _make_solution("wrong", wrong_code)
     registry = BuilderRegistry.get_instance()
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1, atol=1e-6, rtol=1e-6)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1, atol=1e-6, rtol=1e-6)
 
     correctness, evaluation = DsaTopkIndexerEvaluator.check_correctness(
         definition=definition,
@@ -328,7 +328,7 @@ def test_duplicate(tmp_path, tmp_cache_dir):
     solution = _make_solution("duplicate", dup_code)
     registry = BuilderRegistry.get_instance()
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaTopkIndexerEvaluator.check_correctness(
         definition=definition,
@@ -366,7 +366,7 @@ def test_out_of_range(tmp_path, tmp_cache_dir):
     solution = _make_solution("out_of_range", oor_code)
     registry = BuilderRegistry.get_instance()
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaTopkIndexerEvaluator.check_correctness(
         definition=definition,
@@ -404,7 +404,7 @@ def test_unreachable_index(tmp_path, tmp_cache_dir):
     solution = _make_solution("unreachable_index", unreachable_code)
     registry = BuilderRegistry.get_instance()
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaTopkIndexerEvaluator.check_correctness(
         definition=definition,

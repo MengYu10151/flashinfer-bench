@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flashinfer_bench.bench.config import BenchmarkConfig
+from flashinfer_bench.bench.config import BenchmarkConfig, ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators import (
     DsaSparseAttentionEvaluator,
     DsaTopkIndexerEvaluator,
@@ -181,7 +181,7 @@ def test_both_outputs(tmp_path, tmp_cache_dir):
         ),
     )
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaSparseAttentionEvaluator.check_correctness(
         definition=definition,
@@ -214,7 +214,7 @@ def test_output_only(tmp_path, tmp_cache_dir):
         ),
     )
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaSparseAttentionEvaluator.check_correctness(
         definition=definition,
@@ -248,7 +248,7 @@ def test_wrong_output(tmp_path, tmp_cache_dir):
         ),
     )
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1, atol=1e-6, rtol=1e-6)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1, atol=1e-6, rtol=1e-6)
 
     correctness, evaluation = DsaSparseAttentionEvaluator.check_correctness(
         definition=definition,
@@ -281,7 +281,7 @@ def test_empty_output(tmp_path, tmp_cache_dir):
         ),
     )
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaSparseAttentionEvaluator.check_correctness(
         definition=definition,
@@ -316,7 +316,7 @@ def test_too_many_outputs(tmp_path, tmp_cache_dir):
         ),
     )
     sol_runnable = registry.build(definition, solution)
-    cfg = BenchmarkConfig(num_trials=1, warmup_runs=0, iterations=1)
+    cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
 
     correctness, evaluation = DsaSparseAttentionEvaluator.check_correctness(
         definition=definition,
