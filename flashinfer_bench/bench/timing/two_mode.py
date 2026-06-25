@@ -91,11 +91,19 @@ def time_runnable_two_mode(
     ThreeMetrics
         e2e_ms, kernel_ms, kernel_gpu_ms (medians) and status strings.
     """
+    # Measurement order: kernel_ms → kernel_gpu_ms → e2e.
+    #
+    # We deliberately put e2e LAST. R8 decode_b32 diagnostic (sbatch 2806102)
+    # established that running e2e first leaves ~+13 µs of persistent state
+    # in FA3's C/C++ side (unreachable from Python — empty_cache, _state.clear,
+    # and module reimport all fail to fix it) which biases subsequent kernel_ms
+    # / kernel_gpu_ms on decode-heavy big-batch shapes. By measuring kernel_ms
+    # FIRST (cold FA3 state), we capture the true cross-library-comparable
+    # kernel time. e2e by definition incorporates wrapper overhead — whatever
+    # came before is just preceding work it doesn't care about.
     lock = _device_lock(device)
     with lock:
         with torch.cuda.device(device):
-            e2e_ms = _measure_e2e(runnable, args, warmup, iters, device)
-            _cool_down(device)
             kernel_ms, kernel_status = _measure_kernel_cudagraph(
                 runnable, args, warmup, graph_iters, iters, device
             )
@@ -103,6 +111,8 @@ def time_runnable_two_mode(
             kernel_gpu_ms, kernel_gpu_status = _measure_kernel_gpu_cupti(
                 runnable, args, warmup, iters, device
             )
+            _cool_down(device)
+            e2e_ms = _measure_e2e(runnable, args, warmup, iters, device)
     return ThreeMetrics(
         e2e_ms=e2e_ms,
         kernel_ms=kernel_ms,
