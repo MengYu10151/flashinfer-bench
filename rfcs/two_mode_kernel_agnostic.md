@@ -1,8 +1,8 @@
 # RFC: Kernel-Agnostic Two-Mode Timing for flashinfer-bench
 
-**Author**: yuny  
-**Branch**: `feat/two-mode-kernel-agnostic`  
-**Stacked on**: menyu's `feat/setup-hook` (cherry-picked as commit 1)  
+**Author**: yuny
+**Branch**: `feat/two-mode-kernel-agnostic`
+**Stacked on**: menyu's `feat/setup-hook` (cherry-picked as commit 1)
 **Status**: Draft — pending review
 
 ---
