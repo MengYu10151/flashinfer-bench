@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flashinfer_bench.bench.config import BenchmarkConfig, ResolvedEvalConfig
+from flashinfer_bench.bench.config import ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators import (
     DsaSparseAttentionEvaluator,
     DsaTopkIndexerEvaluator,

@@ -7,9 +7,7 @@ tests are guarded with ``pytest.mark.skipif(torch.cuda.device_count() == 0)``.
 
 from __future__ import annotations
 
-import statistics
 import warnings
-from typing import Any, List
 from unittest.mock import patch
 
 import pytest
@@ -331,7 +329,6 @@ class TestMeasureKernelCudagraph:
             _ = t.sum()
 
         runnable = _make_runnable(_run, _setup)
-        original_graph = torch.cuda.CUDAGraph
 
         def _raising_graph(*args, **kwargs):
             raise RuntimeError("simulated capture failure")
