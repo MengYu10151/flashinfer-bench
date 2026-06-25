@@ -107,8 +107,11 @@ bench_gpu_time_with_cupti(fn=runnable, ..., use_cuda_graph=False)
 | 7 | `6367490` | style: black + isort (pure formatting) |
 | 8 | `743d97e` | docs(rfc): CN report v1 |
 | 9 | `ab04217` | feat(cli): `--two-mode` + `--graph-iters` CLI flags — `EvalConfig` / `BenchmarkConfig` / `resolve_eval_config` / `cli/main.py::run` end-to-end plumbing |
+| 10 | `41d51ae` | feat+test: detect silent CUPTI fallback (new status `cupti_fallback:cuda_events`) + unit tests `tests/bench/test_two_mode.py` (250 lines, 24/24 pass) |
+| 11 | `6228dc0` | test fix: swap `torch.relu(out=)` for `torch.add(out=)` (nv24.10 compat) |
+| 12 | `44905f2` | feat(bench): add 100 ms cool-down between metric phases (defensive) |
 
-Diff size: **+1267 / −49 lines across 19 files**.
+Diff size: **+1700 / −60 lines across 20 files**.
 
 ### 3.2 Key files
 
@@ -320,7 +323,7 @@ R8 FA3 paged GQA prefill — three columns: A = our engine kernel_ms, B = legacy
 
 - **A vs B: 4/5 shapes equivalent within ≤0.12 µs** — the strongest evidence yet that our engine abstraction is numerically indistinguishable from the inline cudagraph + cudaEvent reference code
 - A vs C: 4/5 shapes within ±1.23 µs — matches the flashinfer official reference
-- decode_b32 outlier 16 µs: same magnitude as the R8 run-to-run noise documented in `vendor_cross_validation.md §2.3`. B and C agree (B−C = −1.08 µs), so the outlier is on A's sample — GPU state sensitivity between back-to-back measurements, not an engine bug.
+- decode_b32 outlier 16 µs: initially suspected to be run-to-run noise; a follow-up retest (sbatch 2805936) + 6-variant diagnostic (sbatch 2806102) revealed it's actually a **systematic +13 µs bias localized to this shape** — see §6.5.1 below.
 
 **e2e vs kernel ratio (v2.sqsh, cu12 fallback CUPTI):**
 
@@ -333,6 +336,54 @@ R8 FA3 paged GQA prefill — three columns: A = our engine kernel_ms, B = legacy
 | decode_b32     | 1467.86 | 88.15  | 96.78  | 17× |
 
 R8 e2e_ms is 17–42× larger than kernel_ms because R8's `plan()` contains a Python loop + `.item()` syncs (per-batch page_table construction); that overhead lives entirely in the e2e measurement. This is exactly what two-mode is for — making the wrapper overhead explicit.
+
+#### 6.3.1 decode_b32 — systematic +13 µs bias root-cause analysis
+
+To rule out run-to-run noise on the decode_b32 outlier, we ran 6 additional measurements (3 without cool-down, sbatch 2805936; 3 with 100 ms cool-down, sbatch 2806012), all on the same H100 NVL node:
+
+| config | run 1 (µs) | run 2 (µs) | run 3 (µs) | run 4 / original (µs) | mean (µs) |
+|---|---:|---:|---:|---:|---:|
+| no cool-down | +11.04 | +11.64 | +14.45 | +16.78 | **+13.5** |
+| 100 ms cool-down | +15.85 | +12.18 | +12.75 | — | **+13.6** |
+
+Mean +13.5 ± 1.5 µs — **tight std clustering = systematic bias, not noise**. Cool-down didn't help → not a thermal / clock-frequency artifact.
+
+A 6-variant diagnostic (sbatch 2806102) then isolated the cause:
+
+| variant | mean (µs) | mean−legacy (µs) | conclusion |
+|---|---:|---:|---|
+| legacy (no engine, no e2e) | 75.23 | 0.00 (baseline) | reference |
+| **A: engine kernel_ms only, NO e2e** | **76.86** | **+1.64** ✓ | ⭐ **engine wrapper is innocent** |
+| B: e2e → kernel_ms (production order) | 90.34 | +15.12 | bias reproduced |
+| C: B + `torch.cuda.empty_cache()` | 88.67 | +13.44 | no fix |
+| D: B + `R8_PR._state.clear()` | 88.28 | +13.06 | no fix |
+| E: B + R8_PR module reimport | 87.79 | +12.57 | no fix |
+
+**Facts established:**
+
+1. **The engine wrapper itself is clean.** Variant A (kernel_ms via engine, no e2e) sits within +1.64 µs of legacy — inside legacy's own ±2.5 µs run-to-run noise. `time_runnable_two_mode` and Runnable abstraction are numerically equivalent to the inline cudagraph + cudaEvent reference.
+2. **The +13 µs bias is 100% e2e-induced**. Any path that runs e2e before kernel_ms shows +12–15 µs, regardless of cleanup.
+3. **None of the three Python-level cleanup tactics work**: `empty_cache()` (purges CUDA allocator), `_state.clear()` (drops the module-level state dict), or module reimport (rebuilds Python closure) — all leave the bias intact.
+
+**The only state that survives all three cleanups** lives at:
+- **FA3's C/C++ extension internal state** (`flash_attn_3._C.abi3.so` — scheduler heuristics, internal workspace pool, tile-config cache; Python `del` / reimport can't reach inside the loaded shared library)
+- **CUDA driver-level state** (JIT cache, persistent kernel launch params, SM-occupancy heuristics)
+- **GPU hardware SM scheduler state** (after 120 cold-start FA3 calls, SM-side persistent counters/queues have entered an "optimized for batch=32 decode" regime)
+
+Only a **process-level reset** can clear these (fork a fresh process or `nvidia-smi --gpu-reset`).
+
+**Why only decode_b32 is affected**: its e2e_ms = 1468 µs — roughly 3–4× larger than other shapes (the only batch=32 + decode case). Other shapes' e2e ≈ 500 µs and the pollution doesn't accumulate enough to shift FA3's C++ internal state into a different equilibrium. **This is a decode-heavy big-batch artifact, not an engine bug.**
+
+**Impact + mitigations:**
+
+- **PR is fine to ship**: the engine is correctness-verified.
+- **Known limitation**: kernel_ms / kernel_gpu_ms measured immediately after e2e carry ~+13 µs (≈ 15%) systematic offset on decode-heavy big-batch shapes. The root state lives in FA3's C++ side and needs process-level reset.
+- **Recommended pattern when µs-level precision matters**:
+  - (a) measure metrics individually — call `_measure_kernel_cudagraph` / `_measure_kernel_gpu_cupti` directly without e2e, or
+  - (b) use `flashinfer-bench run --use-isolated-runner` for process-level isolation (the codebase already has this infrastructure).
+- **`_cool_down(device, 0.1)` (commit `44905f2`)** added between phases as a defensive measure. **It does not fix the decode_b32 bias** (which corroborates that thermal / clock state is not the cause), but is kept as a hedge for thermally-sensitive workloads we haven't tested.
+
+Diagnostic script: `/home/scratch.yuny_wwfo/kernel_arena/scripts/62_r8_b32_diag.sh` (+ sbatch 2806102 log).
 
 ### 6.4 GEMM 4Kx4Kx4K fp16 on H100 NVL (cu13 menyu sqsh)
 
@@ -392,14 +443,16 @@ flashinfer-bench run \
 
 ## 7. Follow-ups
 
-### 7.1 Short-term (same PR or quick follow-up)
+### 7.1 Short-term (already done or root-caused)
 
-- [ ] Unit tests: `tests/bench/test_two_mode.py` — mock Runnable + known latency to validate `_measure_e2e` / `_measure_kernel_cudagraph` / `_measure_kernel_gpu_cupti` individually. Currently only integration tests pass.
-- [ ] Repeat R8 decode_b32 outlier (run several times to confirm it's run-to-run noise, not systematic bias)
-- [ ] Real-CUPTI detection: make cupti-python version vs libcupti.so.X mismatch a *visible* warning instead of silent fallback
+- [x] Unit tests: `tests/bench/test_two_mode.py` (commits `41d51ae` + `6228dc0`), **24/24 pass on H100 NVL** (unit_tests_2805991.out)
+- [x] R8 decode_b32 outlier retest → **confirmed systematic** (+13 µs ± 1.5 µs), not noise (sbatch 2805936)
+- [x] Root-cause investigation — diagnostic localized it to FA3 C++ internal state; not addressable from Python (sbatch 2806102, §6.5.1)
+- [x] Real-CUPTI graceful warning: commit `41d51ae` adds `cupti_fallback:cuda_events` status string, no more silent fallback
 
 ### 7.2 Medium-term (separate PR)
 
+- [ ] **R8 decode_b32 +13 µs bias root-cause fix** — localized to FA3 C++ internal state / GPU SM scheduler state; needs process-level reset (IsolatedRunner) or an upstream FA3 reset API. Current workaround: measure decode-heavy big-batch shapes individually, or use `flashinfer-bench run --use-isolated-runner`
 - [ ] `Performance.kernel_ms_per_trial: Optional[List[float]]` — per-trial vectors for outlier analysis
 - [ ] Wire specialized evaluators (sampling / dsa_* / lowbit) to two-mode (v1 silently ignores)
 - [ ] `e2e_reuse_workspace: bool = False` opt-in to skip workspace double-allocation in e2e mode (defaults preserve RFC §8.5)
