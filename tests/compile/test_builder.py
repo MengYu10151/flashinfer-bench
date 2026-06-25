@@ -371,6 +371,7 @@ def test_validate_signature_dps_kwonly_accepted_for_setup_hook_injection():
     Previously this raised BuildError; now the validator tolerates required kw-only args
     because they map to dict keys returned by the optional ``setup()`` symbol.
     """
+
     # Required kw-only
     def func_required_kwonly(A, B, out, *, scale):
         pass

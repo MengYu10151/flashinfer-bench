@@ -306,3 +306,17 @@ definitions. All single-metric tests remain green.
 6. **`Performance` records the mean only** for v1 (`kernel_ms`,
    `kernel_gpu_ms`). Per-trial vectors are out of scope; can be added later as
    `kernel_ms_per_trial: Optional[List[float]]` without breaking compat.
+7. **Measurement order: `kernel_ms` → `kernel_gpu_ms` → `e2e`** (e2e last).
+   The R8 decode_b32 diagnostic (see implementation report §6.3) showed that
+   running `e2e` first leaves persistent state in FA3's C/C++ shared library
+   (workspace pool / scheduler heuristics / tile-config cache) that biases
+   the *next* measurement by ~+13 µs on decode-heavy big-batch shapes. None
+   of the Python-side cleanups (`torch.cuda.empty_cache`, module-state
+   `.clear()`, full module reimport) can reach inside the loaded `.so` —
+   only a process-level reset (IsolatedRunner / `nvidia-smi --gpu-reset`)
+   clears it. The reorder lets `kernel_ms` see cold FA3 state; `e2e`
+   incorporates all preceding wrapper overhead anyway, so it doesn't care
+   that other measurements ran first. A 100 ms `_cool_down` is also added
+   between phases as a defensive measure (does not fix the FA3 bias on its
+   own but cheap insurance for thermal/clock-state-sensitive workloads we
+   haven't profiled yet).
