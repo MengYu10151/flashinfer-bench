@@ -20,6 +20,7 @@ decisions (Q1-Q6 in §8).
 from __future__ import annotations
 
 import statistics
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, List, Tuple
@@ -94,9 +95,11 @@ def time_runnable_two_mode(
     with lock:
         with torch.cuda.device(device):
             e2e_ms = _measure_e2e(runnable, args, warmup, iters, device)
+            _cool_down(device)
             kernel_ms, kernel_status = _measure_kernel_cudagraph(
                 runnable, args, warmup, graph_iters, iters, device
             )
+            _cool_down(device)
             kernel_gpu_ms, kernel_gpu_status = _measure_kernel_gpu_cupti(
                 runnable, args, warmup, iters, device
             )
@@ -119,6 +122,23 @@ def _maybe_clone(a: Any) -> Any:
     if isinstance(a, torch.Tensor):
         return a.clone()
     return a
+
+
+def _cool_down(device: str, seconds: float = 0.1) -> None:
+    """Brief sync + idle between metric phases.
+
+    Without this the three measurements run back-to-back; on shapes where one
+    phase (typically e2e) does significant per-iter Python + GPU work
+    (e.g. R8 FA3 decode_b32 with batch=32 plan() that .item()-syncs per batch
+    entry), the GPU's clock/thermal state shifts and the *next* phase's
+    cudagraph or CUPTI numbers come out systematically biased relative to a
+    cold-start measurement.
+
+    100 ms is short enough not to noticeably slow benchmark runs and long
+    enough for GPU clocks to settle in our R8 retest.
+    """
+    torch.cuda.synchronize(device)
+    time.sleep(seconds)
 
 
 def _median_cudaevent(fn: Callable[[], Any], iters: int, device: str) -> float:
