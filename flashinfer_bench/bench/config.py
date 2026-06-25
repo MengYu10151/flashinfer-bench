@@ -25,6 +25,11 @@ class EvalConfig(BaseModel):
     """Absolute tolerance for numerical checks. `None` means inherit."""
     required_matched_ratio: Optional[float] = Field(default=None, gt=0, le=1)
     """Minimum fraction of elements that must be within tolerance. `None` means inherit."""
+    two_mode: Optional[bool] = Field(default=None)
+    """Opt-in to two-mode timing (e2e + kernel_ms + kernel_gpu_ms). `None` means inherit."""
+    graph_iters: Optional[int] = Field(default=None, gt=0)
+    """CUDA-graph capture batch size for ``kernel_ms`` (only used when ``two_mode=True``).
+    `None` means inherit."""
     extra: Dict[str, Any] = Field(default_factory=dict)
     """Evaluator-specific parameters that do not belong in the shared schema."""
 
@@ -96,6 +101,10 @@ class BenchmarkConfig(BaseModel):
     """CLI override for absolute tolerance. None means inherit from YAML / defaults."""
     required_matched_ratio: Optional[float] = Field(default=None, gt=0, le=1)
     """CLI override for required matched ratio. None means inherit from YAML / defaults."""
+    two_mode: Optional[bool] = Field(default=None)
+    """CLI override for two-mode opt-in. None means inherit from YAML / defaults (False)."""
+    graph_iters: Optional[int] = Field(default=None, gt=0)
+    """CLI override for CUDA-graph capture batch size (kernel_ms). None means inherit."""
     # Deprecated: use op_type_config/definition_config extra instead. Kept as
     # top-level CLI-style overrides for the same reason as the other eval fields:
     # None means "not set at this layer"; non-None wins over YAML layer.extra.
@@ -167,6 +176,8 @@ class BenchmarkConfig(BaseModel):
             "rtol": self.rtol,
             "atol": self.atol,
             "required_matched_ratio": self.required_matched_ratio,
+            "two_mode": self.two_mode,
+            "graph_iters": self.graph_iters,
         }
         merged.update({k: v for k, v in top_level.items() if v is not None})
 
