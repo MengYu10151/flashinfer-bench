@@ -14,6 +14,7 @@ from torch import multiprocessing as mp
 import flashinfer_bench.utils as fib_utils
 from flashinfer_bench.bench.config import BenchmarkConfig
 from flashinfer_bench.bench.evaluators import resolve_evaluator
+from flashinfer_bench.bench.preflight import SolutionPreflightError, ensure_solution_runtime_ready
 from flashinfer_bench.bench.utils import make_eval
 from flashinfer_bench.compile import BuilderRegistry, Runnable
 from flashinfer_bench.data import Definition, Evaluation, EvaluationStatus, Solution, Workload
@@ -231,6 +232,14 @@ def _solution_worker_main(
             return
 
         # Build impl
+        try:
+            ensure_solution_runtime_ready(solution, device)
+        except SolutionPreflightError as e:
+            print(f"Solution preflight failed: {e}")
+            ev = make_eval(status=EvaluationStatus.COMPILE_ERROR, device=device, log_path=log_path)
+            conn.send({"cmd": "EVAL", "evaluation": ev})
+            return
+
         try:
             runnable_sol: Runnable = registry.build(definition, solution)
         except Exception as e:

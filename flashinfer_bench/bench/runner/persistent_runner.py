@@ -16,6 +16,7 @@ from torch import multiprocessing as mp
 import flashinfer_bench.utils as fib_utils
 from flashinfer_bench.bench.config import BenchmarkConfig
 from flashinfer_bench.bench.evaluators import resolve_evaluator
+from flashinfer_bench.bench.preflight import SolutionPreflightError, ensure_solution_runtime_ready
 from flashinfer_bench.bench.utils import make_eval
 from flashinfer_bench.compile import BuilderRegistry, BuildError
 from flashinfer_bench.data import Definition, Evaluation, EvaluationStatus, Solution, Workload
@@ -681,6 +682,7 @@ def _persistent_worker_main(conn: mp.connection.Connection, device: str) -> None
                     log_path = redirect_stdio_to_tempfile()
 
                     try:
+                        ensure_solution_runtime_ready(solution, device)
                         # Use registry to build/get cached solution
                         runnable_sol = registry.build(definition, solution)
 
@@ -711,6 +713,14 @@ def _persistent_worker_main(conn: mp.connection.Connection, device: str) -> None
 
                         print(f"BuildError: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
 
+                        evaluation = make_eval(
+                            status=EvaluationStatus.COMPILE_ERROR, device=device, log_path=log_path
+                        )
+                        conn.send(
+                            {"cmd": WorkerResponse.EVALUATION.value, "evaluation": evaluation}
+                        )
+                    except SolutionPreflightError as e:
+                        print(f"Solution preflight failed: {e}")
                         evaluation = make_eval(
                             status=EvaluationStatus.COMPILE_ERROR, device=device, log_path=log_path
                         )
