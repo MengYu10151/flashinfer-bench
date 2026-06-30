@@ -13,8 +13,8 @@ setup-hook convention (solution module exports a top-level ``setup`` symbol):
 * ``kernel_gpu_ms`` : hardware ground truth via CUPTI activity sum (eager
                       dispatch, ``use_cuda_graph=False``). 0.0 if unavailable.
 
-See ``rfcs/two_mode_kernel_agnostic.md`` for the full design and locked
-decisions (Q1-Q6 in §8).
+The default single-metric timing path is unchanged; this module is only used
+when two-mode timing is explicitly enabled.
 """
 
 from __future__ import annotations
@@ -91,16 +91,11 @@ def time_runnable_two_mode(
     ThreeMetrics
         e2e_ms, kernel_ms, kernel_gpu_ms (medians) and status strings.
     """
-    # Measurement order: kernel_ms → kernel_gpu_ms → e2e.
+    # Measurement order: kernel_ms -> kernel_gpu_ms -> e2e.
     #
-    # We deliberately put e2e LAST. R8 decode_b32 diagnostic (sbatch 2806102)
-    # established that running e2e first leaves ~+13 µs of persistent state
-    # in FA3's C/C++ side (unreachable from Python — empty_cache, _state.clear,
-    # and module reimport all fail to fix it) which biases subsequent kernel_ms
-    # / kernel_gpu_ms on decode-heavy big-batch shapes. By measuring kernel_ms
-    # FIRST (cold FA3 state), we capture the true cross-library-comparable
-    # kernel time. e2e by definition incorporates wrapper overhead — whatever
-    # came before is just preceding work it doesn't care about.
+    # Run the kernel-only measurements first so their values are less likely to
+    # be affected by any persistent wrapper state, synchronization, or GPU clock
+    # effects introduced by the heavier end-to-end phase.
     lock = _device_lock(device)
     with lock:
         with torch.cuda.device(device):
@@ -137,15 +132,13 @@ def _maybe_clone(a: Any) -> Any:
 def _cool_down(device: str, seconds: float = 0.1) -> None:
     """Brief sync + idle between metric phases.
 
-    Without this the three measurements run back-to-back; on shapes where one
-    phase (typically e2e) does significant per-iter Python + GPU work
-    (e.g. R8 FA3 decode_b32 with batch=32 plan() that .item()-syncs per batch
-    entry), the GPU's clock/thermal state shifts and the *next* phase's
-    cudagraph or CUPTI numbers come out systematically biased relative to a
-    cold-start measurement.
+    Without this the three measurements run back-to-back. A short pause helps
+    separate phase-local wrapper work from the following kernel-only timing
+    pass, especially on workloads whose setup path synchronizes or launches
+    auxiliary kernels.
 
-    100 ms is short enough not to noticeably slow benchmark runs and long
-    enough for GPU clocks to settle in our R8 retest.
+    100 ms is short enough not to noticeably slow benchmark runs while giving
+    the device a brief chance to settle between metric phases.
     """
     torch.cuda.synchronize(device)
     time.sleep(seconds)
@@ -211,8 +204,8 @@ def _measure_kernel_cudagraph(
     """
     runnable.setup_for_workload(*args)
 
-    # Warmup against the original args so internal state (lazy-init in
-    # FlashInfer wrappers, FA3 first-call paths, ...) is settled before capture.
+    # Warmup against the original args so lazy initialization and wrapper
+    # first-call paths are settled before graph capture.
     for _ in range(warmup):
         runnable(*args)
     torch.cuda.synchronize(device)
@@ -250,8 +243,8 @@ def _measure_kernel_gpu_cupti(
     eager dispatch. Uses CUPTI activity sum (pure GPU exec, excludes Python
     inter-kernel gaps).
 
-    Distinct mechanism from ``kernel_ms`` — eager + CUPTI vs cudagraph +
-    cudaEvent — by design (see RFC §8 decision 3). The two metrics should
+    Distinct mechanism from ``kernel_ms`` -- eager + CUPTI vs cudagraph +
+    cudaEvent -- by design. The two metrics should
     agree within a few µs for graph-capturable kernels; a wider gap is
     diagnostic of capture failure / multi-kernel host-side sync / CUPTI
     span-vs-sum issues.

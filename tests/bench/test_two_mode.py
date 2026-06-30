@@ -255,8 +255,8 @@ class TestMedianCudaevent:
 @cuda_available
 class TestMeasureE2E:
     def test_setup_called_once_per_iter(self):
-        """Per RFC §8.5: e2e re-runs setup_for_workload inside the timing
-        region. Verify it's called warmup+iters times total."""
+        """e2e re-runs setup_for_workload inside the timing region.
+        Verify it's called warmup+iters times total."""
         called = {"setup": 0, "run": 0}
 
         def _setup(t):
