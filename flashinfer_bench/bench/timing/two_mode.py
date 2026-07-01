@@ -224,11 +224,15 @@ def _measure_kernel_cudagraph(
         median = _median_cudaevent(lambda: runnable(*args), replays, device)
         return median, f"fallback_eager:{type(ex).__name__}"
 
-    # Prime replay (first replay can carry one-off init cost)
-    graph.replay()
+    # Prime replay (first replay can carry one-off init cost). Replays are
+    # launched and timed on the capture stream so cudaEvents bracket the actual
+    # graph work instead of only measuring launch overhead on the default stream.
+    with torch.cuda.stream(stream):
+        graph.replay()
     torch.cuda.synchronize(device)
 
-    median_graph = _median_cudaevent(graph.replay, replays, device)
+    with torch.cuda.stream(stream):
+        median_graph = _median_cudaevent(graph.replay, replays, device)
     return median_graph / graph_iters, "ok"
 
 
