@@ -1,4 +1,4 @@
-"""Kernel-agnostic two-mode timing engine.
+"""Kernel-agnostic split timing engine.
 
 Produces three first-class metrics for any ``Runnable`` that follows the
 setup-hook convention (solution module exports a top-level ``setup`` symbol):
@@ -14,7 +14,7 @@ setup-hook convention (solution module exports a top-level ``setup`` symbol):
                       dispatch, ``use_cuda_graph=False``). 0.0 if unavailable.
 
 The default single-metric timing path is unchanged; this module is only used
-when two-mode timing is explicitly enabled.
+when split timing is explicitly enabled.
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ from ._common import _device_lock
 
 
 @dataclass(frozen=True)
-class ThreeMetrics:
-    """Output of :func:`time_runnable_two_mode`.
+class SplitTimingMetrics:
+    """Output of :func:`time_runnable_split_timing`.
 
     All times are medians in milliseconds. ``kernel_ms`` and ``kernel_gpu_ms``
     are ``0.0`` if the corresponding measurement could not be taken (reason in
@@ -57,7 +57,7 @@ class ThreeMetrics:
     CUPTI activity sum)."""
 
 
-def time_runnable_two_mode(
+def time_runnable_split_timing(
     runnable: Runnable,
     args: List[Any],
     warmup: int,
@@ -65,7 +65,7 @@ def time_runnable_two_mode(
     device: str,
     *,
     graph_iters: int = 20,
-) -> ThreeMetrics:
+) -> SplitTimingMetrics:
     """Measure e2e / kernel / kernel_gpu in one call.
 
     Parameters
@@ -88,7 +88,7 @@ def time_runnable_two_mode(
 
     Returns
     -------
-    ThreeMetrics
+    SplitTimingMetrics
         e2e_ms, kernel_ms, kernel_gpu_ms (medians) and status strings.
     """
     # Measurement order: kernel_ms -> kernel_gpu_ms -> e2e.
@@ -108,7 +108,7 @@ def time_runnable_two_mode(
             )
             _cool_down(device)
             e2e_ms = _measure_e2e(runnable, args, warmup, iters, device)
-    return ThreeMetrics(
+    return SplitTimingMetrics(
         e2e_ms=e2e_ms,
         kernel_ms=kernel_ms,
         kernel_gpu_ms=kernel_gpu_ms,

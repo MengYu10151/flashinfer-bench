@@ -13,9 +13,9 @@ from flashinfer.testing import bench_gpu_time_with_cupti
 from flashinfer_bench.compile import Runnable
 
 from ._common import _device_lock
-from .two_mode import ThreeMetrics, time_runnable_two_mode
+from .split_timing import SplitTimingMetrics, time_runnable_split_timing
 
-__all__ = ["time_runnable", "time_runnable_two_mode", "ThreeMetrics"]
+__all__ = ["time_runnable", "time_runnable_split_timing", "SplitTimingMetrics"]
 
 
 def time_runnable(fn: Runnable, args: List[Any], warmup: int, iters: int, device: str) -> float:

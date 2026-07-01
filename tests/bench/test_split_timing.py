@@ -1,7 +1,7 @@
-"""Unit tests for the kernel-agnostic two-mode timing engine.
+"""Unit tests for the kernel-agnostic split timing engine.
 
-Covers ``ThreeMetrics`` schema, the internal ``_measure_*`` helpers, and the
-top-level ``time_runnable_two_mode`` API. CPU-only tests use mocks; GPU-required
+Covers ``SplitTimingMetrics`` schema, the internal ``_measure_*`` helpers, and the
+top-level ``time_runnable_split_timing`` API. CPU-only tests use mocks; GPU-required
 tests are guarded with ``pytest.mark.skipif(torch.cuda.device_count() == 0)``.
 """
 
@@ -15,8 +15,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from flashinfer_bench.bench.timing import ThreeMetrics, time_runnable_two_mode
-from flashinfer_bench.bench.timing.two_mode import (
+from flashinfer_bench.bench.timing import SplitTimingMetrics, time_runnable_split_timing
+from flashinfer_bench.bench.timing.split_timing import (
     _maybe_clone,
     _measure_e2e,
     _measure_kernel_cudagraph,
@@ -44,13 +44,13 @@ def _make_runnable(run_fn, setup_fn=None) -> Runnable:
 
 
 # -----------------------------------------------------------------------------
-# ThreeMetrics dataclass — schema, frozenness, defaults
+# SplitTimingMetrics dataclass — schema, frozenness, defaults
 # -----------------------------------------------------------------------------
 
 
-class TestThreeMetrics:
+class TestSplitTimingMetrics:
     def test_construct_with_all_fields(self):
-        m = ThreeMetrics(
+        m = SplitTimingMetrics(
             e2e_ms=1.5,
             kernel_ms=0.3,
             kernel_gpu_ms=0.32,
@@ -64,7 +64,7 @@ class TestThreeMetrics:
         assert m.kernel_gpu_ms_status == "ok"
 
     def test_frozen(self):
-        m = ThreeMetrics(1.0, 0.1, 0.1, "ok", "ok")
+        m = SplitTimingMetrics(1.0, 0.1, 0.1, "ok", "ok")
         with pytest.raises((AttributeError, TypeError)):
             m.e2e_ms = 2.0
 
@@ -118,7 +118,7 @@ class TestMeasureKernelGpuCupti:
     def test_returns_no_cupti_when_import_fails(self):
         runnable, called = self._build_runnable()
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti",
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
             side_effect=ModuleNotFoundError("No module named 'cupti'"),
         ):
             ms, status = _measure_kernel_gpu_cupti(
@@ -133,7 +133,7 @@ class TestMeasureKernelGpuCupti:
     def test_returns_no_cupti_when_runtime_error(self):
         runnable, _ = self._build_runnable()
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti",
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
             side_effect=RuntimeError("Incompatible CUPTI Library"),
         ):
             ms, status = _measure_kernel_gpu_cupti(
@@ -145,7 +145,7 @@ class TestMeasureKernelGpuCupti:
     def test_returns_cupti_no_samples_on_empty(self):
         runnable, _ = self._build_runnable()
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti", return_value=[]
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti", return_value=[]
         ):
             ms, status = _measure_kernel_gpu_cupti(
                 runnable, [42], warmup=1, iters=1, device="cuda:0"
@@ -157,7 +157,7 @@ class TestMeasureKernelGpuCupti:
         runnable, _ = self._build_runnable()
         # Three samples; median is the middle one.
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti",
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
             return_value=[0.1, 0.2, 0.3],
         ):
             ms, status = _measure_kernel_gpu_cupti(
@@ -184,7 +184,7 @@ class TestMeasureKernelGpuCupti:
             return [0.1, 0.2, 0.3]
 
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti",
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
             side_effect=_fake_bench,
         ):
             ms, status = _measure_kernel_gpu_cupti(
@@ -207,7 +207,7 @@ class TestMeasureKernelGpuCupti:
             return [1.0]
 
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti",
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
             side_effect=_fake_bench,
         ):
             _, status = _measure_kernel_gpu_cupti(
@@ -224,7 +224,7 @@ class TestMeasureKernelGpuCupti:
             return [0.5]
 
         with patch(
-            "flashinfer_bench.bench.timing.two_mode.bench_gpu_time_with_cupti",
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
             side_effect=_fake_bench,
         ):
             _, status = _measure_kernel_gpu_cupti(
@@ -362,11 +362,11 @@ class TestTimeRunnableTwoMode:
             torch.mul(a, b, out=out)
 
         runnable = _make_runnable(_run, _setup)
-        m = time_runnable_two_mode(
+        m = time_runnable_split_timing(
             runnable, [a, b], warmup=3, iters=5, device="cuda:0", graph_iters=5
         )
 
-        assert isinstance(m, ThreeMetrics)
+        assert isinstance(m, SplitTimingMetrics)
         assert m.e2e_ms > 0.0
         # kernel_ms may be 0 only when graph-capture *and* eager fallback both
         # fail — extremely unlikely for a simple mul, so assert positive.
@@ -396,7 +396,7 @@ class TestTimeRunnableTwoMode:
             torch.add(t, t, out=out)
 
         runnable = _make_runnable(_run, _setup)
-        m = time_runnable_two_mode(
+        m = time_runnable_split_timing(
             runnable, [a], warmup=5, iters=10, device="cuda:0", graph_iters=5
         )
         # 5x slack to absorb noise on extremely small kernels; the inequality

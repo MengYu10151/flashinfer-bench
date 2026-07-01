@@ -44,14 +44,14 @@ class Performance(BaseModelWithDocstrings):
 
     When the evaluator runs in single-metric mode (default), only
     ``latency_ms`` / ``reference_latency_ms`` / ``speedup_factor`` are
-    populated. When ``ResolvedEvalConfig.two_mode=True``, the additional
+    populated. When ``ResolvedEvalConfig.split_timing=True``, the additional
     ``kernel_ms`` and ``kernel_gpu_ms`` fields carry the cudagraph-cudaEvent
     median and CUPTI activity-sum median respectively. Both Optional so
-    pre-two-mode trace JSONs round-trip unchanged.
+    pre-split-timing trace JSONs round-trip unchanged.
     """
 
     latency_ms: float = Field(default=0.0, ge=0.0)
-    """Solution execution latency in milliseconds. Under two-mode this carries
+    """Solution execution latency in milliseconds. Under split timing this carries
     the ``e2e_ms`` median (clone + setup + run inside the timed region)."""
     reference_latency_ms: float = Field(default=0.0, ge=0.0)
     """Reference implementation latency in milliseconds for comparison."""
@@ -60,18 +60,18 @@ class Performance(BaseModelWithDocstrings):
     kernel_ms: Optional[float] = Field(default=None, ge=0.0)
     """Cross-library-comparable pure kernel time in milliseconds (cudagraph
     capture + cudaEvent replay, divided by ``graph_iters``). ``None`` outside
-    two-mode. ``0.0`` if capture failed (see ``kernel_ms_status``)."""
+    split timing. ``0.0`` if capture failed (see ``kernel_ms_status``)."""
     kernel_gpu_ms: Optional[float] = Field(default=None, ge=0.0)
     """Hardware ground-truth kernel exec time in milliseconds (CUPTI activity
-    sum, eager dispatch). ``None`` outside two-mode. ``0.0`` if CUPTI was
+    sum, eager dispatch). ``None`` outside split timing. ``0.0`` if CUPTI was
     unavailable (see ``kernel_gpu_ms_status``)."""
     kernel_ms_status: Optional[str] = Field(default=None)
     """Status of the ``kernel_ms`` measurement (``"ok"``,
-    ``"fallback_eager:<Exception>"``, etc.). ``None`` outside two-mode."""
+    ``"fallback_eager:<Exception>"``, etc.). ``None`` outside split timing."""
     kernel_gpu_ms_status: Optional[str] = Field(default=None)
     """Status of the ``kernel_gpu_ms`` measurement (``"ok"``,
     ``"no_cupti:<Exception>"``, ``"cupti_no_samples"``). ``None`` outside
-    two-mode."""
+    split timing."""
 
 
 class Environment(BaseModelWithDocstrings):

@@ -12,9 +12,9 @@ from flashinfer_bench.bench.config import ResolvedEvalConfig
 from flashinfer_bench.bench.evaluators.evaluator import Evaluator
 from flashinfer_bench.bench.runner.runner import BaselineHandle, DeviceBaseline
 from flashinfer_bench.bench.timing import (
-    ThreeMetrics,
+    SplitTimingMetrics,
     time_runnable,
-    time_runnable_two_mode,
+    time_runnable_split_timing,
 )
 from flashinfer_bench.bench.utils import (
     compute_error_stats,
@@ -201,15 +201,15 @@ class DefaultEvaluator(Evaluator):
                 return list(inp) + allocate_outputs(definition, inp, device)
             return list(inp)
 
-        if cfg.two_mode:
+        if cfg.split_timing:
             try:
-                trial_metrics: List[ThreeMetrics] = []
+                trial_metrics: List[SplitTimingMetrics] = []
                 for inp in inputs:
                     args = _args_for(inp)
-                    # time_runnable_two_mode handles setup invocation internally
+                    # time_runnable_split_timing handles setup invocation internally
                     # (once-outside for kernel_ms / kernel_gpu_ms; per-iter for
                     # e2e_ms). Do NOT call setup_for_workload here.
-                    metrics = time_runnable_two_mode(
+                    metrics = time_runnable_split_timing(
                         sol_runnable,
                         args,
                         cfg.warmup_runs,

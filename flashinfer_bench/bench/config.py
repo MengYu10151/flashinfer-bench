@@ -25,10 +25,10 @@ class EvalConfig(BaseModel):
     """Absolute tolerance for numerical checks. `None` means inherit."""
     required_matched_ratio: Optional[float] = Field(default=None, gt=0, le=1)
     """Minimum fraction of elements that must be within tolerance. `None` means inherit."""
-    two_mode: Optional[bool] = Field(default=None)
-    """Opt-in to two-mode timing (e2e + kernel_ms + kernel_gpu_ms). `None` means inherit."""
+    split_timing: Optional[bool] = Field(default=None)
+    """Opt-in to split timing (e2e + kernel_ms + kernel_gpu_ms). `None` means inherit."""
     graph_iters: Optional[int] = Field(default=None, gt=0)
-    """CUDA-graph capture batch size for ``kernel_ms`` (only used when ``two_mode=True``).
+    """CUDA-graph capture batch size for ``kernel_ms`` (only used when ``split_timing=True``).
     `None` means inherit."""
     extra: Dict[str, Any] = Field(default_factory=dict)
     """Evaluator-specific parameters that do not belong in the shared schema."""
@@ -51,14 +51,14 @@ class ResolvedEvalConfig(BaseModel):
     """Minimum fraction of elements that must be within tolerance."""
     profile_baseline: bool = True
     """Whether to profile the reference implementation for baseline latency."""
-    two_mode: bool = False
+    split_timing: bool = False
     """Opt-in: collect e2e_ms + kernel_ms + kernel_gpu_ms instead of a single
-    fused latency. When True, evaluators dispatch to ``time_runnable_two_mode``
+    fused latency. When True, evaluators dispatch to ``time_runnable_split_timing``
     and populate ``Performance.kernel_ms`` / ``kernel_gpu_ms`` alongside
     ``latency_ms`` (which carries the e2e median). When False, behavior is
-    unchanged from before two-mode was introduced."""
+    unchanged from before split timing was introduced."""
     graph_iters: int = Field(default=20, gt=0)
-    """When ``two_mode=True``: number of ``run()`` calls captured into a single
+    """When ``split_timing=True``: number of ``run()`` calls captured into a single
     CUDA graph for the ``kernel_ms`` metric. Replay time is divided by this to
     get per-call kernel time. Tune up on ultra-small kernels where graph
     replay overhead dominates."""
@@ -101,8 +101,8 @@ class BenchmarkConfig(BaseModel):
     """CLI override for absolute tolerance. None means inherit from YAML / defaults."""
     required_matched_ratio: Optional[float] = Field(default=None, gt=0, le=1)
     """CLI override for required matched ratio. None means inherit from YAML / defaults."""
-    two_mode: Optional[bool] = Field(default=None)
-    """CLI override for two-mode opt-in. None means inherit from YAML / defaults (False)."""
+    split_timing: Optional[bool] = Field(default=None)
+    """CLI override for split-timing opt-in. None means inherit from YAML / defaults (False)."""
     graph_iters: Optional[int] = Field(default=None, gt=0)
     """CLI override for CUDA-graph capture batch size (kernel_ms). None means inherit."""
     # Deprecated: use op_type_config/definition_config extra instead. Kept as
@@ -176,7 +176,7 @@ class BenchmarkConfig(BaseModel):
             "rtol": self.rtol,
             "atol": self.atol,
             "required_matched_ratio": self.required_matched_ratio,
-            "two_mode": self.two_mode,
+            "split_timing": self.split_timing,
             "graph_iters": self.graph_iters,
         }
         merged.update({k: v for k, v in top_level.items() if v is not None})

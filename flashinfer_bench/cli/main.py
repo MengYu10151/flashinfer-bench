@@ -296,7 +296,7 @@ def run(args: argparse.Namespace):
             "timeout_seconds": args.timeout,
             "required_matched_ratio": args.required_matched_ratio,
             "profile_baseline": args.profile_baseline,
-            "two_mode": args.two_mode,
+            "split_timing": args.split_timing,
             "graph_iters": args.graph_iters,
         }
         cli_overrides = {k: v for k, v in raw_cli_overrides.items() if v is not None}
@@ -508,11 +508,11 @@ def cli():
         "Useful when the reference is slow (e.g. large prefill workloads).",
     )
     run_parser.add_argument(
-        "--two-mode",
-        dest="two_mode",
+        "--split-timing",
+        dest="split_timing",
         action="store_true",
         default=None,
-        help="Enable two-mode timing: Performance gains e2e_ms (latency_ms) + kernel_ms "
+        help="Enable split timing: Performance gains e2e_ms (latency_ms) + kernel_ms "
         "(cudagraph+cudaEvent) + kernel_gpu_ms (CUPTI activity sum). "
         "Default: off (single-metric latency_ms only).",
     )
@@ -522,7 +522,7 @@ def cli():
         type=int,
         default=None,
         help="Number of run() calls captured into one CUDA graph for kernel_ms "
-        "(only used when --two-mode is set). Default: 20.",
+        "(only used when --split-timing is set). Default: 20.",
     )
     run_parser.add_argument(
         "--local",
