@@ -27,8 +27,8 @@ class EvalConfig(BaseModel):
     """Minimum fraction of elements that must be within tolerance. `None` means inherit."""
     split_timing: Optional[bool] = Field(default=None)
     """Opt-in to split timing (e2e + kernel_ms + kernel_gpu_ms). `None` means inherit."""
-    graph_iters: Optional[int] = Field(default=None, gt=0)
-    """CUDA-graph capture batch size for ``kernel_ms`` (only used when ``split_timing=True``).
+    cold_l2_cache: Optional[bool] = Field(default=None)
+    """L2 policy for split timing. True selects cold L2; False selects warm L2;
     `None` means inherit."""
     extra: Dict[str, Any] = Field(default_factory=dict)
     """Evaluator-specific parameters that do not belong in the shared schema."""
@@ -57,11 +57,9 @@ class ResolvedEvalConfig(BaseModel):
     and populate ``Performance.kernel_ms`` / ``kernel_gpu_ms`` alongside
     ``latency_ms`` (which carries the e2e median). When False, behavior is
     unchanged from before split timing was introduced."""
-    graph_iters: int = Field(default=20, gt=0)
-    """When ``split_timing=True``: number of ``run()`` calls captured into a single
-    CUDA graph for the ``kernel_ms`` metric. Replay time is divided by this to
-    get per-call kernel time. Tune up on ultra-small kernels where graph
-    replay overhead dominates."""
+    cold_l2_cache: bool = True
+    """L2 policy shared by split-timing metrics. Defaults to cold L2, matching
+    FlashInfer's benchmark helpers. Set False for warm-cache measurements."""
     extra: Dict[str, Any] = Field(default_factory=dict)
     """Evaluator-specific parameters after all config layers have been merged."""
 
@@ -103,8 +101,8 @@ class BenchmarkConfig(BaseModel):
     """CLI override for required matched ratio. None means inherit from YAML / defaults."""
     split_timing: Optional[bool] = Field(default=None)
     """CLI override for split-timing opt-in. None means inherit from YAML / defaults (False)."""
-    graph_iters: Optional[int] = Field(default=None, gt=0)
-    """CLI override for CUDA-graph capture batch size (kernel_ms). None means inherit."""
+    cold_l2_cache: Optional[bool] = Field(default=None)
+    """CLI override for split-timing L2 policy. None means inherit from YAML / defaults."""
     # Deprecated: use op_type_config/definition_config extra instead. Kept as
     # top-level CLI-style overrides for the same reason as the other eval fields:
     # None means "not set at this layer"; non-None wins over YAML layer.extra.
@@ -177,7 +175,7 @@ class BenchmarkConfig(BaseModel):
             "atol": self.atol,
             "required_matched_ratio": self.required_matched_ratio,
             "split_timing": self.split_timing,
-            "graph_iters": self.graph_iters,
+            "cold_l2_cache": self.cold_l2_cache,
         }
         merged.update({k: v for k, v in top_level.items() if v is not None})
 

@@ -45,7 +45,7 @@ class Performance(BaseModelWithDocstrings):
     When the evaluator runs in single-metric mode (default), only
     ``latency_ms`` / ``reference_latency_ms`` / ``speedup_factor`` are
     populated. When ``ResolvedEvalConfig.split_timing=True``, the additional
-    ``kernel_ms`` and ``kernel_gpu_ms`` fields carry the cudagraph-cudaEvent
+    ``kernel_ms`` and ``kernel_gpu_ms`` fields carry the eager CUDA Event
     median and CUPTI activity-sum median respectively. Both Optional so
     pre-split-timing trace JSONs round-trip unchanged.
     """
@@ -58,20 +58,21 @@ class Performance(BaseModelWithDocstrings):
     speedup_factor: float = Field(default=0.0, ge=0.0)
     """Performance speedup factor compared to reference (reference_time / solution_time)."""
     kernel_ms: Optional[float] = Field(default=None, ge=0.0)
-    """Cross-library-comparable pure kernel time in milliseconds (cudagraph
-    capture + cudaEvent replay, divided by ``graph_iters``). ``None`` outside
-    split timing. ``0.0`` if capture failed (see ``kernel_ms_status``)."""
+    """Eager ``run()`` latency in milliseconds measured with CUDA Events after
+    one setup call outside timing. ``None`` outside split timing."""
     kernel_gpu_ms: Optional[float] = Field(default=None, ge=0.0)
     """Hardware ground-truth kernel exec time in milliseconds (CUPTI activity
     sum, eager dispatch). ``None`` outside split timing. ``0.0`` if CUPTI was
     unavailable (see ``kernel_gpu_ms_status``)."""
     kernel_ms_status: Optional[str] = Field(default=None)
-    """Status of the ``kernel_ms`` measurement (``"ok"``,
-    ``"fallback_eager:<Exception>"``, etc.). ``None`` outside split timing."""
+    """Status of the ``kernel_ms`` measurement (``"ok"`` when collected).
+    ``None`` outside split timing."""
     kernel_gpu_ms_status: Optional[str] = Field(default=None)
     """Status of the ``kernel_gpu_ms`` measurement (``"ok"``,
     ``"no_cupti:<Exception>"``, ``"cupti_no_samples"``). ``None`` outside
     split timing."""
+    l2_cache_mode: Optional[str] = Field(default=None, pattern="^(cold|warm)$")
+    """L2 policy used for all split-timing metrics. ``None`` outside split timing."""
 
 
 class Environment(BaseModelWithDocstrings):

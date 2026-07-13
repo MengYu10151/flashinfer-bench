@@ -7,9 +7,7 @@ tests are guarded with ``pytest.mark.skipif(torch.cuda.device_count() == 0)``.
 
 from __future__ import annotations
 
-import statistics
 import warnings
-from typing import Any, List
 from unittest.mock import patch
 
 import pytest
@@ -19,9 +17,8 @@ from flashinfer_bench.bench.timing import SplitTimingMetrics, time_runnable_spli
 from flashinfer_bench.bench.timing.split_timing import (
     _maybe_clone,
     _measure_e2e,
-    _measure_kernel_cudagraph,
+    _measure_kernel_cudaevent,
     _measure_kernel_gpu_cupti,
-    _median_cudaevent,
 )
 from flashinfer_bench.compile import Runnable, RunnableMetadata
 
@@ -166,6 +163,23 @@ class TestMeasureKernelGpuCupti:
         assert ms == pytest.approx(0.2)
         assert status == "ok"
 
+    @pytest.mark.parametrize("cold_l2_cache", [True, False])
+    def test_passes_l2_policy_to_cupti(self, cold_l2_cache):
+        runnable, _ = self._build_runnable()
+        with patch(
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cupti",
+            return_value=[0.2],
+        ) as bench:
+            _measure_kernel_gpu_cupti(
+                runnable,
+                [42],
+                warmup=1,
+                iters=1,
+                device="cuda:0",
+                cold_l2_cache=cold_l2_cache,
+            )
+        assert bench.call_args.kwargs["cold_l2_cache"] is cold_l2_cache
+
     def test_detects_silent_cupti_fallback_via_warning(self):
         """Flashinfer's `bench_gpu_time_with_cupti` emits a UserWarning when it
         can't reach a real CUPTI runtime and silently falls back to CUDA events.
@@ -233,6 +247,45 @@ class TestMeasureKernelGpuCupti:
         assert status == "ok"
 
 
+class TestCudaEventL2Policy:
+    @pytest.mark.parametrize("cold_l2_cache", [True, False])
+    def test_kernel_measurement_passes_l2_policy(self, cold_l2_cache):
+        runnable = _make_runnable(lambda *_args: None, lambda *_args: {})
+        with patch(
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cuda_event",
+            return_value=[0.4],
+        ) as bench:
+            ms, status = _measure_kernel_cudaevent(
+                runnable,
+                [42],
+                warmup=1,
+                iters=1,
+                device="cuda:0",
+                cold_l2_cache=cold_l2_cache,
+            )
+        assert ms == pytest.approx(0.4)
+        assert status == "ok"
+        assert bench.call_args.kwargs["cold_l2_cache"] is cold_l2_cache
+
+    @pytest.mark.parametrize("cold_l2_cache", [True, False])
+    def test_e2e_measurement_passes_l2_policy(self, cold_l2_cache):
+        runnable = _make_runnable(lambda *_args: None, lambda *_args: {})
+        with patch(
+            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cuda_event",
+            return_value=[0.8],
+        ) as bench:
+            ms = _measure_e2e(
+                runnable,
+                [42],
+                warmup=1,
+                iters=1,
+                device="cuda:0",
+                cold_l2_cache=cold_l2_cache,
+            )
+        assert ms == pytest.approx(0.8)
+        assert bench.call_args.kwargs["cold_l2_cache"] is cold_l2_cache
+
+
 # -----------------------------------------------------------------------------
 # GPU-required tests below
 # -----------------------------------------------------------------------------
@@ -243,20 +296,10 @@ cuda_available = pytest.mark.skipif(
 
 
 @cuda_available
-class TestMedianCudaevent:
-    def test_returns_positive_finite_ms(self):
-        # A trivial GPU op — just need to verify a cudaEvent pair returns >0 ms.
-        x = torch.randn(1024, device="cuda")
-        ms = _median_cudaevent(lambda: x.sum(), iters=5, device="cuda:0")
-        assert ms > 0.0
-        assert ms < 100.0  # sanity bound — a single small reduction is fast
-
-
-@cuda_available
 class TestMeasureE2E:
     def test_setup_called_once_per_iter(self):
         """e2e re-runs setup_for_workload inside the timing region.
-        Verify it's called warmup+iters times total."""
+        Verify setup and run stay paired for every full invocation."""
         called = {"setup": 0, "run": 0}
 
         def _setup(t):
@@ -271,9 +314,9 @@ class TestMeasureE2E:
         x = torch.randn(64, device="cuda")
         WARMUP, ITERS = 3, 5
         ms = _measure_e2e(runnable, [x], warmup=WARMUP, iters=ITERS, device="cuda:0")
-        # Each iter calls setup once + run once → warmup+iters of each
-        assert called["setup"] == WARMUP + ITERS
-        assert called["run"] == WARMUP + ITERS
+        # FlashInfer's timing helper may run additional estimation samples.
+        assert called["setup"] == called["run"]
+        assert called["setup"] >= WARMUP + ITERS
         assert ms > 0.0
 
     def test_tensors_are_cloned_per_iter(self):
@@ -294,11 +337,9 @@ class TestMeasureE2E:
 
 
 @cuda_available
-class TestMeasureKernelCudagraph:
+class TestMeasureKernelCudaEvent:
     def test_happy_path_returns_ok(self):
-        """A simple capturable kernel should produce a cudagraph + cudaEvent
-        median > 0 with status="ok"."""
-        # Pre-allocate outputs so capture has stable buffers.
+        """A simple eager kernel should produce a CUDA Event median > 0."""
         a = torch.randn(128, device="cuda")
         b = torch.randn(128, device="cuda")
         out = torch.empty(128, device="cuda")
@@ -310,43 +351,32 @@ class TestMeasureKernelCudagraph:
             torch.add(a, b, out=out)
 
         runnable = _make_runnable(_run, _setup)
-        ms, status = _measure_kernel_cudagraph(
-            runnable, [a, b], warmup=3, graph_iters=5, replays=5, device="cuda:0"
-        )
+        ms, status = _measure_kernel_cudaevent(runnable, [a, b], warmup=3, iters=5, device="cuda:0")
         assert status == "ok"
         assert ms > 0.0
 
-    def test_fallback_when_capture_raises(self):
-        """If torch.cuda.graph raises (e.g. due to host-sync in run()), the
-        engine should fall back to eager dispatch with status starting
-        ``fallback_eager:``."""
+    def test_setup_runs_once_outside_measurement(self):
         a = torch.randn(64, device="cuda")
+        called = {"setup": 0, "run": 0}
 
         def _setup(t):
+            called["setup"] += 1
             return {}
 
         def _run(t):
-            # Sum is fine on its own; we'll force a graph-capture failure
-            # by patching torch.cuda.CUDAGraph to raise.
+            called["run"] += 1
             _ = t.sum()
 
         runnable = _make_runnable(_run, _setup)
-        original_graph = torch.cuda.CUDAGraph
-
-        def _raising_graph(*args, **kwargs):
-            raise RuntimeError("simulated capture failure")
-
-        with patch("torch.cuda.CUDAGraph", _raising_graph):
-            ms, status = _measure_kernel_cudagraph(
-                runnable, [a], warmup=2, graph_iters=3, replays=3, device="cuda:0"
-            )
-        assert status.startswith("fallback_eager:")
-        assert "RuntimeError" in status
+        ms, status = _measure_kernel_cudaevent(runnable, [a], warmup=2, iters=3, device="cuda:0")
+        assert called["setup"] == 1
+        assert called["run"] >= 5
+        assert status == "ok"
         assert ms > 0.0
 
 
 @cuda_available
-class TestTimeRunnableTwoMode:
+class TestTimeRunnableSplitTiming:
     """End-to-end: invoke the public API on a mock Runnable, verify all three
     metrics + both status strings come back populated and finite."""
 
@@ -362,19 +392,15 @@ class TestTimeRunnableTwoMode:
             torch.mul(a, b, out=out)
 
         runnable = _make_runnable(_run, _setup)
-        m = time_runnable_split_timing(
-            runnable, [a, b], warmup=3, iters=5, device="cuda:0", graph_iters=5
-        )
+        m = time_runnable_split_timing(runnable, [a, b], warmup=3, iters=5, device="cuda:0")
 
         assert isinstance(m, SplitTimingMetrics)
         assert m.e2e_ms > 0.0
-        # kernel_ms may be 0 only when graph-capture *and* eager fallback both
-        # fail — extremely unlikely for a simple mul, so assert positive.
         assert m.kernel_ms > 0.0
         # kernel_gpu_ms may be 0 if cupti is unavailable; status string then
         # documents the reason. Either way, status must be one of the known
         # values.
-        assert m.kernel_ms_status in ("ok",) or m.kernel_ms_status.startswith("fallback_eager:")
+        assert m.kernel_ms_status == "ok"
         assert m.kernel_gpu_ms_status in (
             "ok",
             "cupti_no_samples",
@@ -396,9 +422,7 @@ class TestTimeRunnableTwoMode:
             torch.add(t, t, out=out)
 
         runnable = _make_runnable(_run, _setup)
-        m = time_runnable_split_timing(
-            runnable, [a], warmup=5, iters=10, device="cuda:0", graph_iters=5
-        )
+        m = time_runnable_split_timing(runnable, [a], warmup=5, iters=10, device="cuda:0")
         # 5x slack to absorb noise on extremely small kernels; the inequality
         # is robust on any non-trivial workload.
         assert m.e2e_ms >= m.kernel_ms * 0.5

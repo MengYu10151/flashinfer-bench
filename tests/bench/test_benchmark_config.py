@@ -21,6 +21,7 @@ def test_benchmark_config_defaults_valid():
     assert resolved.iterations > 0
     assert resolved.num_trials > 0
     assert resolved.rtol > 0 and resolved.atol > 0
+    assert resolved.cold_l2_cache is True
 
 
 @pytest.mark.parametrize(
@@ -101,6 +102,15 @@ def test_cli_override_beats_yaml_op_type():
     definition = SimpleNamespace(op_type="moe", name="some_moe_def")
     resolved = cfg.resolve_eval_config(definition)
     assert resolved.required_matched_ratio == 0.9
+
+
+def test_l2_policy_respects_config_precedence():
+    definition = SimpleNamespace(op_type="moe", name="some_moe_def")
+    cfg = BenchmarkConfig(
+        cold_l2_cache=False,
+        op_type_config={"moe": EvalConfig(cold_l2_cache=True)},
+    )
+    assert cfg.resolve_eval_config(definition).cold_l2_cache is False
 
 
 def test_yaml_op_type_applies_without_cli_override():

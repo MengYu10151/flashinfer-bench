@@ -215,7 +215,7 @@ class DefaultEvaluator(Evaluator):
                         cfg.warmup_runs,
                         cfg.iterations,
                         device,
-                        graph_iters=cfg.graph_iters,
+                        cold_l2_cache=cfg.cold_l2_cache,
                     )
                     trial_metrics.append(metrics)
             except Exception:
@@ -252,6 +252,7 @@ class DefaultEvaluator(Evaluator):
                 kernel_gpu_ms=kernel_gpu_mean,
                 kernel_ms_status=kernel_status,
                 kernel_gpu_ms_status=kernel_gpu_status,
+                l2_cache_mode="cold" if cfg.cold_l2_cache else "warm",
             )
             return performance, None
 

@@ -297,7 +297,7 @@ def run(args: argparse.Namespace):
             "required_matched_ratio": args.required_matched_ratio,
             "profile_baseline": args.profile_baseline,
             "split_timing": args.split_timing,
-            "graph_iters": args.graph_iters,
+            "cold_l2_cache": args.cold_l2_cache,
         }
         cli_overrides = {k: v for k, v in raw_cli_overrides.items() if v is not None}
         config_path = getattr(args, "config", None)
@@ -513,16 +513,22 @@ def cli():
         action="store_true",
         default=None,
         help="Enable split timing: Performance gains e2e_ms (latency_ms) + kernel_ms "
-        "(cudagraph+cudaEvent) + kernel_gpu_ms (CUPTI activity sum). "
+        "(eager CUDA Event) + kernel_gpu_ms (CUPTI activity sum). "
         "Default: off (single-metric latency_ms only).",
     )
-    run_parser.add_argument(
-        "--graph-iters",
-        dest="graph_iters",
-        type=int,
+    l2_cache_group = run_parser.add_mutually_exclusive_group()
+    l2_cache_group.add_argument(
+        "--cold-l2-cache",
+        dest="cold_l2_cache",
+        action="store_true",
         default=None,
-        help="Number of run() calls captured into one CUDA graph for kernel_ms "
-        "(only used when --split-timing is set). Default: 20.",
+        help="Flush L2 before each split-timing sample (default).",
+    )
+    l2_cache_group.add_argument(
+        "--warm-l2-cache",
+        dest="cold_l2_cache",
+        action="store_false",
+        help="Do not flush L2 between split-timing samples.",
     )
     run_parser.add_argument(
         "--local",

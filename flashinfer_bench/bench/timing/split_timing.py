@@ -6,10 +6,8 @@ setup-hook convention (solution module exports a top-level ``setup`` symbol):
 * ``e2e_ms``        : full wrapper cost — each iter clones all tensor args
                       AND re-runs setup() inside the timed region (cudaEvent,
                       eager dispatch). Models a naive serving call.
-* ``kernel_ms``     : cross-library-comparable pure kernel time — setup runs
-                      ONCE outside, the ``run()`` callable is captured into a
-                      CUDA graph, and replay is timed via cudaEvent.
-                      Falls back to eager dispatch if capture fails.
+* ``kernel_ms``     : eager ``run()`` latency measured with CUDA Events —
+                      setup runs ONCE outside the timed region.
 * ``kernel_gpu_ms`` : hardware ground truth via CUPTI activity sum (eager
                       dispatch, ``use_cuda_graph=False``). 0.0 if unavailable.
 
@@ -23,10 +21,10 @@ import statistics
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, List, Tuple
+from typing import Any, List, Tuple
 
 import torch
-from flashinfer.testing import bench_gpu_time_with_cupti
+from flashinfer.testing import bench_gpu_time_with_cuda_event, bench_gpu_time_with_cupti
 
 from flashinfer_bench.compile import Runnable
 
@@ -39,15 +37,14 @@ class SplitTimingMetrics:
 
     All times are medians in milliseconds. ``kernel_ms`` and ``kernel_gpu_ms``
     are ``0.0`` if the corresponding measurement could not be taken (reason in
-    the ``*_status`` field, e.g. ``"fallback_eager:RuntimeError"`` or
-    ``"no_cupti:ModuleNotFoundError"``).
+    the ``*_status`` field, e.g. ``"no_cupti:ModuleNotFoundError"``).
     """
 
     e2e_ms: float
     kernel_ms: float
     kernel_gpu_ms: float
     kernel_ms_status: str
-    """``"ok"`` | ``"fallback_eager:<Exception>"`` (cudagraph capture failed)."""
+    """``"ok"`` when eager CUDA Event measurement completed."""
     kernel_gpu_ms_status: str
     """``"ok"`` | ``"no_cupti:<Exception>"`` (cupti-python not importable) |
     ``"cupti_no_samples"`` (CUPTI returned an empty list) |
@@ -64,7 +61,7 @@ def time_runnable_split_timing(
     iters: int,
     device: str,
     *,
-    graph_iters: int = 20,
+    cold_l2_cache: bool = True,
 ) -> SplitTimingMetrics:
     """Measure e2e / kernel / kernel_gpu in one call.
 
@@ -78,13 +75,15 @@ def time_runnable_split_timing(
     warmup : int
         Warmup iterations before each timed measurement.
     iters : int
-        Timed iterations per metric (e2e cudaEvent samples, cudagraph
-        replays, CUPTI activity rounds).
+        Timed iterations per metric (e2e CUDA Event samples, eager run-only
+        CUDA Event samples, and CUPTI activity rounds).
     device : str
         CUDA device id (e.g. ``"cuda:0"``).
-    graph_iters : int
-        Number of ``run()`` calls captured into a single CUDA graph.
-        ``kernel_ms`` is reported as ``replay_time / graph_iters``.
+    cold_l2_cache : bool
+        Apply the same L2 policy to all three metrics. ``True`` flushes L2
+        before each measured invocation; ``False`` preserves warm-cache state.
+        For ``e2e_ms`` this describes the start of the full clone + setup + run
+        invocation, not the cache state at the internal ``run()`` boundary.
 
     Returns
     -------
@@ -99,15 +98,15 @@ def time_runnable_split_timing(
     lock = _device_lock(device)
     with lock:
         with torch.cuda.device(device):
-            kernel_ms, kernel_status = _measure_kernel_cudagraph(
-                runnable, args, warmup, graph_iters, iters, device
+            kernel_ms, kernel_status = _measure_kernel_cudaevent(
+                runnable, args, warmup, iters, device, cold_l2_cache
             )
             _cool_down(device)
             kernel_gpu_ms, kernel_gpu_status = _measure_kernel_gpu_cupti(
-                runnable, args, warmup, iters, device
+                runnable, args, warmup, iters, device, cold_l2_cache
             )
             _cool_down(device)
-            e2e_ms = _measure_e2e(runnable, args, warmup, iters, device)
+            e2e_ms = _measure_e2e(runnable, args, warmup, iters, device, cold_l2_cache)
     return SplitTimingMetrics(
         e2e_ms=e2e_ms,
         kernel_ms=kernel_ms,
@@ -144,24 +143,13 @@ def _cool_down(device: str, seconds: float = 0.1) -> None:
     time.sleep(seconds)
 
 
-def _median_cudaevent(fn: Callable[[], Any], iters: int, device: str) -> float:
-    """Time ``fn()`` ``iters`` times with cudaEvent pairs; return median ms."""
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    for i in range(iters):
-        starts[i].record()
-        fn()
-        ends[i].record()
-    torch.cuda.synchronize(device)
-    return statistics.median(starts[i].elapsed_time(ends[i]) for i in range(iters))
-
-
 def _measure_e2e(
     runnable: Runnable,
     args: List[Any],
     warmup: int,
     iters: int,
     device: str,
+    cold_l2_cache: bool = True,
 ) -> float:
     """e2e_ms — clone all tensor args + re-run setup + run inside the timed region.
 
@@ -176,64 +164,39 @@ def _measure_e2e(
     worst-case naive-serving cost.
     """
 
-    def one() -> None:
+    def one(*_unused_args: Any) -> None:
         cloned = tuple(_maybe_clone(a) for a in args)
         runnable.setup_for_workload(*cloned)
         runnable(*cloned)
 
-    for _ in range(warmup):
-        one()
-    torch.cuda.synchronize(device)
-    return _median_cudaevent(one, iters, device)
+    times = bench_gpu_time_with_cuda_event(
+        fn=one,
+        dry_run_iters=warmup,
+        repeat_iters=iters,
+        input_args=tuple(args),
+        cold_l2_cache=cold_l2_cache,
+    )
+    return statistics.median(times)
 
 
-def _measure_kernel_cudagraph(
+def _measure_kernel_cudaevent(
     runnable: Runnable,
     args: List[Any],
     warmup: int,
-    graph_iters: int,
-    replays: int,
+    iters: int,
     device: str,
+    cold_l2_cache: bool = True,
 ) -> Tuple[float, str]:
-    """kernel_ms — setup ONCE outside; capture ``run()`` into a CUDA graph;
-    cudaEvent over graph replay (divided by ``graph_iters`` per replay).
-
-    Falls back to eager dispatch with status ``fallback_eager:<Exception>`` if
-    the kernel cannot be captured (stream-ordered allocators, host syncs in
-    ``run``, unsupported ops, etc.).
-    """
+    """kernel_ms — setup once outside, then eager ``run()`` via CUDA Events."""
     runnable.setup_for_workload(*args)
-
-    # Warmup against the original args so lazy initialization and wrapper
-    # first-call paths are settled before graph capture.
-    for _ in range(warmup):
-        runnable(*args)
-    torch.cuda.synchronize(device)
-
-    try:
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                for _ in range(graph_iters):
-                    runnable(*args)
-        torch.cuda.current_stream(device).wait_stream(stream)
-    except (RuntimeError, NotImplementedError) as ex:
-        # Fallback: eager dispatch, no graph
-        median = _median_cudaevent(lambda: runnable(*args), replays, device)
-        return median, f"fallback_eager:{type(ex).__name__}"
-
-    # Prime replay (first replay can carry one-off init cost). Replays are
-    # launched and timed on the capture stream so cudaEvents bracket the actual
-    # graph work instead of only measuring launch overhead on the default stream.
-    with torch.cuda.stream(stream):
-        graph.replay()
-    torch.cuda.synchronize(device)
-
-    with torch.cuda.stream(stream):
-        median_graph = _median_cudaevent(graph.replay, replays, device)
-    return median_graph / graph_iters, "ok"
+    times = bench_gpu_time_with_cuda_event(
+        fn=runnable,
+        dry_run_iters=warmup,
+        repeat_iters=iters,
+        input_args=tuple(args),
+        cold_l2_cache=cold_l2_cache,
+    )
+    return statistics.median(times), "ok"
 
 
 def _measure_kernel_gpu_cupti(
@@ -242,16 +205,15 @@ def _measure_kernel_gpu_cupti(
     warmup: int,
     iters: int,
     device: str,
+    cold_l2_cache: bool = True,
 ) -> Tuple[float, str]:
     """kernel_gpu_ms — setup ONCE outside; ``bench_gpu_time_with_cupti`` on
     eager dispatch. Uses CUPTI activity sum (pure GPU exec, excludes Python
     inter-kernel gaps).
 
-    Distinct mechanism from ``kernel_ms`` -- eager + CUPTI vs cudagraph +
-    cudaEvent -- by design. The two metrics should
-    agree within a few µs for graph-capturable kernels; a wider gap is
-    diagnostic of capture failure / multi-kernel host-side sync / CUPTI
-    span-vs-sum issues.
+    Distinct mechanism from ``kernel_ms``: CUPTI activity sum versus eager
+    CUDA Event elapsed time. A wider gap is diagnostic of multi-kernel launch
+    gaps or CUPTI span-versus-sum differences.
     """
     runnable.setup_for_workload(*args)
     # Capture warnings so we can detect flashinfer's internal CUPTI-fallback
@@ -268,7 +230,7 @@ def _measure_kernel_gpu_cupti(
                 dry_run_iters=warmup,
                 repeat_iters=iters,
                 input_args=tuple(args),
-                cold_l2_cache=True,
+                cold_l2_cache=cold_l2_cache,
                 use_cuda_graph=False,
             )
         except Exception as ex:
