@@ -19,6 +19,7 @@ from flashinfer_bench.bench.timing import (
 from flashinfer_bench.bench.utils import (
     compute_error_stats,
     gen_inputs,
+    is_sampling_operation,
     load_safetensors,
     make_eval,
 )
@@ -33,6 +34,35 @@ from flashinfer_bench.data import (
 )
 
 from .utils import allocate_outputs, normalize_result
+
+# Floating tensors with at least this many dims count as "payload" (q/kv/activation
+# data) for the setup-hook contract; lower-rank float tensors (per-channel scales,
+# scalar knobs) and all integer/bool tensors count as metadata.
+_PAYLOAD_MIN_NDIM = 2
+
+
+def _has_setup_hook(runnable: Runnable) -> bool:
+    """True only for real Runnables that declare a setup hook (mock-safe)."""
+    return getattr(runnable, "has_setup_hook", False) is True
+
+
+def _full_call_target(sol_runnable: Runnable):
+    """Return the callable the single-metric latency path should time.
+
+    For setup-hook solutions, setup() must run INSIDE the timed region every
+    iteration — identical semantics to a plain solution that does its planning
+    inline — so ``latency_ms`` stays comparable across solution styles and
+    with pre-setup-hook traces. Solutions without a setup hook are passed
+    through untouched (bit-identical to the original path).
+    """
+    if not _has_setup_hook(sol_runnable):
+        return sol_runnable
+
+    def _setup_and_run(*args: Any) -> Any:
+        sol_runnable.setup_for_workload(*args)
+        return sol_runnable(*args)
+
+    return _setup_and_run
 
 
 class DefaultEvaluator(Evaluator):
@@ -181,7 +211,122 @@ class DefaultEvaluator(Evaluator):
                 correctness=correctness,
             )
 
+        if _has_setup_hook(sol_runnable):
+            evaluation = cls._check_setup_payload_independence(
+                definition=definition,
+                sol_runnable=sol_runnable,
+                inputs=inputs,
+                cfg=cfg,
+                log_path=log_path,
+                device=device,
+            )
+            if evaluation is not None:
+                return None, evaluation
+
         return correctness, None
+
+    @classmethod
+    def _check_setup_payload_independence(
+        cls,
+        definition: Definition,
+        sol_runnable: Runnable,
+        inputs: List[List[Any]],
+        cfg: ResolvedEvalConfig,
+        log_path: str,
+        device: str,
+    ) -> Optional[Evaluation]:
+        """Enforce the setup-hook contract: state must not depend on payload values.
+
+        ``setup()`` receives the real input tensors, so a solution could compute
+        its full result there — outside every timed region — and have ``run()``
+        replay the cached answer. Correctness on the original inputs cannot catch
+        this. Enforcement: bind the cached state to the first trial's inputs,
+        re-randomize the floating-point payload tensors (ndim >= 2) IN PLACE
+        while leaving metadata (integer/bool tensors, scalars, low-rank float
+        tensors) untouched so legitimately cached plans stay valid, then re-run
+        ``run()`` with the stale state and compare against a freshly computed
+        reference on the mutated inputs.
+
+        Returns None when the check passes (or is vacuous), otherwise a failed
+        Evaluation. The mutated trial keeps its new payload values afterwards —
+        harmless, since correctness already passed and timing for these kernels
+        is value-independent.
+        """
+        inp = inputs[0]
+        is_dps = sol_runnable.metadata.destination_passing_style
+
+        # 1. Bind cached state to the ORIGINAL payload values.
+        if is_dps:
+            out_tensors = allocate_outputs(definition, inp, device)
+            sol_runnable.setup_for_workload(*inp, *out_tensors)
+        else:
+            sol_runnable.setup_for_workload(*inp)
+
+        # 2. Re-randomize floating payload tensors in place (same generator
+        #    family as gen_inputs; sampling "probs" keeps its simplex property).
+        names = list(definition.inputs.keys())
+        mutated = 0
+        with torch.no_grad():
+            for name, arg in zip(names, inp):
+                if not isinstance(arg, torch.Tensor):
+                    continue
+                if not arg.is_floating_point() or arg.ndim < _PAYLOAD_MIN_NDIM:
+                    continue
+                fresh = torch.randn(arg.shape, dtype=torch.float32, device=arg.device)
+                if is_sampling_operation(definition) and name == "probs":
+                    fresh = torch.softmax(fresh, dim=-1)
+                elif arg.element_size() == 1:
+                    # low-precision floats (fp8/fp4): clamp like gen_inputs does
+                    fresh = fresh.clamp_(-2.0, 2.0)
+                arg.copy_(fresh.to(arg.dtype))
+                mutated += 1
+        if mutated == 0:
+            return None  # no payload tensors — nothing to enforce
+
+        try:
+            # 3. Fresh reference on the mutated inputs.
+            ref_runnable = BuilderRegistry.get_instance().build_reference(definition)
+            with torch.no_grad():
+                ref_result = ref_runnable(*inp)
+            torch.cuda.synchronize(device)
+            ref_out = normalize_result(definition, ref_result, device)
+
+            # 4. Solution re-run with the STALE cached state (no setup re-run).
+            if is_dps:
+                out_tensors = allocate_outputs(definition, inp, device)
+                with torch.no_grad():
+                    sol_runnable(*inp, *out_tensors)
+                torch.cuda.synchronize(device)
+                out = out_tensors
+            else:
+                with torch.no_grad():
+                    result = sol_runnable(*inp)
+                torch.cuda.synchronize(device)
+                out = normalize_result(definition, result, device)
+        except Exception:
+            traceback.print_exc()
+            return make_eval(
+                status=EvaluationStatus.RUNTIME_ERROR, device=device, log_path=log_path
+            )
+
+        for sol_tensor, ref_tensor in zip(out, ref_out):
+            abs_err, rel_err, exceeds_tol, _ = compute_error_stats(sol_tensor, ref_tensor, cfg)
+            if exceeds_tol:
+                print(
+                    "setup-payload-independence check FAILED: run() with the cached "
+                    "setup() state no longer matches the reference after payload "
+                    "re-randomization. setup() state must not depend on floating-point "
+                    f"payload values (max_abs={abs_err:.3e}, max_rel={rel_err:.3e}).",
+                    file=sys.stderr,
+                )
+                correctness = Correctness(max_relative_error=rel_err, max_absolute_error=abs_err)
+                return make_eval(
+                    status=EvaluationStatus.INCORRECT_NUMERICAL,
+                    device=device,
+                    log_path=log_path,
+                    correctness=correctness,
+                )
+        return None
 
     @classmethod
     def eval_performance(
@@ -204,6 +349,7 @@ class DefaultEvaluator(Evaluator):
         if cfg.split_timing:
             try:
                 trial_metrics: List[SplitTimingMetrics] = []
+                trial_latencies: List[float] = []
                 for inp in inputs:
                     args = _args_for(inp)
                     # time_runnable_split_timing handles setup invocation internally
@@ -218,6 +364,21 @@ class DefaultEvaluator(Evaluator):
                         cold_l2_cache=cfg.cold_l2_cache,
                     )
                     trial_metrics.append(metrics)
+                    # latency_ms keeps its single-metric semantics under split
+                    # timing: the full solution call (setup inside the timed
+                    # region for setup-hook solutions) measured by the same
+                    # mechanism as reference_latency_ms — so speedup_factor
+                    # stays apples-to-apples. Measured AFTER the split metrics
+                    # so the kernel-only phases stay uncontaminated by wrapper
+                    # state (see measurement-order note in split_timing).
+                    lat_ms = time_runnable(
+                        _full_call_target(sol_runnable),
+                        args,
+                        cfg.warmup_runs,
+                        cfg.iterations,
+                        device,
+                    )
+                    trial_latencies.append(lat_ms)
             except Exception:
                 traceback.print_exc()
                 return None, make_eval(
@@ -231,23 +392,54 @@ class DefaultEvaluator(Evaluator):
                 )
 
             n = float(len(trial_metrics))
+            lat_mean = sum(trial_latencies) / n
             e2e_mean = sum(m.e2e_ms for m in trial_metrics) / n
             kernel_mean = sum(m.kernel_ms for m in trial_metrics) / n
-            kernel_gpu_mean = sum(m.kernel_gpu_ms for m in trial_metrics) / n
             # Status: report "ok" only if every trial succeeded; else surface
             # the first non-ok value so the user can tell why fallback fired.
             kernel_status = next(
-                (m.kernel_ms_status for m in trial_metrics if m.kernel_ms_status != "ok"),
-                "ok",
+                (m.kernel_ms_status for m in trial_metrics if m.kernel_ms_status != "ok"), "ok"
             )
-            kernel_gpu_status = next(
-                (m.kernel_gpu_ms_status for m in trial_metrics if m.kernel_gpu_ms_status != "ok"),
-                "ok",
-            )
+            # kernel_gpu_ms: never average across mechanisms or unavailable
+            # trials. Real CUPTI activity sums and CUDA-event fallback numbers
+            # are different measurements; None marks "unavailable" (no 0.0
+            # sentinels contaminating a mean).
+            cupti_vals = [
+                m.kernel_gpu_ms
+                for m in trial_metrics
+                if m.kernel_gpu_ms_status == "ok" and m.kernel_gpu_ms is not None
+            ]
+            fallback_vals = [
+                m.kernel_gpu_ms
+                for m in trial_metrics
+                if m.kernel_gpu_ms_status == "cupti_fallback:cuda_events"
+                and m.kernel_gpu_ms is not None
+            ]
+            if cupti_vals:
+                kernel_gpu_mean = sum(cupti_vals) / float(len(cupti_vals))
+                kernel_gpu_status = (
+                    "ok"
+                    if len(cupti_vals) == len(trial_metrics)
+                    else f"ok_partial:{len(cupti_vals)}/{len(trial_metrics)}"
+                )
+            elif fallback_vals:
+                kernel_gpu_mean = sum(fallback_vals) / float(len(fallback_vals))
+                kernel_gpu_status = "cupti_fallback:cuda_events"
+            else:
+                kernel_gpu_mean = None
+                kernel_gpu_status = next(
+                    (
+                        m.kernel_gpu_ms_status
+                        for m in trial_metrics
+                        if m.kernel_gpu_ms_status != "ok"
+                    ),
+                    "cupti_no_samples",
+                )
             performance = Performance(
-                latency_ms=e2e_mean,
+                latency_ms=lat_mean,
                 reference_latency_ms=ref_mean_latency_ms,
-                speedup_factor=(ref_mean_latency_ms / e2e_mean) if e2e_mean > 0 else 0.0,
+                speedup_factor=(ref_mean_latency_ms / lat_mean) if lat_mean > 0 else 0.0,
+                e2e_ms=e2e_mean,
                 kernel_ms=kernel_mean,
                 kernel_gpu_ms=kernel_gpu_mean,
                 kernel_ms_status=kernel_status,
@@ -260,9 +452,14 @@ class DefaultEvaluator(Evaluator):
         try:
             for inp in inputs:
                 args = _args_for(inp)
-                # Per-workload setup (no-op if the solution defines no setup hook).
-                sol_runnable.setup_for_workload(*args)
-                ms = time_runnable(sol_runnable, args, cfg.warmup_runs, cfg.iterations, device)
+                # For setup-hook solutions, _full_call_target times setup + run
+                # together every iteration — identical semantics to a plain
+                # solution doing its planning inline, so latency_ms stays
+                # comparable with existing traces. Solutions without a setup
+                # hook go through bit-identical to the pre-setup-hook path.
+                ms = time_runnable(
+                    _full_call_target(sol_runnable), args, cfg.warmup_runs, cfg.iterations, device
+                )
                 sol_latencies.append(ms)
         except Exception:
             traceback.print_exc()

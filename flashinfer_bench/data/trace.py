@@ -44,33 +44,48 @@ class Performance(BaseModelWithDocstrings):
 
     When the evaluator runs in single-metric mode (default), only
     ``latency_ms`` / ``reference_latency_ms`` / ``speedup_factor`` are
-    populated. When ``ResolvedEvalConfig.split_timing=True``, the additional
-    ``kernel_ms`` and ``kernel_gpu_ms`` fields carry the eager CUDA Event
-    median and CUPTI activity-sum median respectively. Both Optional so
-    pre-split-timing trace JSONs round-trip unchanged.
+    populated — with unchanged semantics. When
+    ``ResolvedEvalConfig.split_timing=True``, the additional ``e2e_ms``,
+    ``kernel_ms`` and ``kernel_gpu_ms`` fields carry the serialized wall-clock
+    median, the eager CUDA Event median and the CUPTI activity-sum median
+    respectively; ``latency_ms`` / ``speedup_factor`` keep their single-metric
+    meaning so traces stay comparable across modes. All new fields are
+    Optional so pre-split-timing trace JSONs round-trip unchanged.
     """
 
     latency_ms: float = Field(default=0.0, ge=0.0)
-    """Solution execution latency in milliseconds. Under split timing this carries
-    the ``e2e_ms`` median (clone + setup + run inside the timed region)."""
+    """Solution execution latency in milliseconds over the full solution call.
+    For setup-hook solutions the setup runs inside the timed region — identical
+    semantics to a plain solution that does its planning inline. Same meaning
+    with and without split timing."""
     reference_latency_ms: float = Field(default=0.0, ge=0.0)
     """Reference implementation latency in milliseconds for comparison."""
     speedup_factor: float = Field(default=0.0, ge=0.0)
-    """Performance speedup factor compared to reference (reference_time / solution_time)."""
+    """Performance speedup factor compared to reference (reference_time / solution_time).
+    Numerator and denominator are measured with the same mechanism and scope."""
+    e2e_ms: Optional[float] = Field(default=None, ge=0.0)
+    """Serialized host wall-clock median of setup + run per invocation, with a
+    device synchronization every iteration (split timing only). Unlike
+    ``latency_ms`` (stream timing that can pipeline), this captures CPU-side
+    wrapper cost even when the GPU is saturated. ``None`` outside split timing."""
     kernel_ms: Optional[float] = Field(default=None, ge=0.0)
     """Eager ``run()`` latency in milliseconds measured with CUDA Events after
     one setup call outside timing. ``None`` outside split timing."""
     kernel_gpu_ms: Optional[float] = Field(default=None, ge=0.0)
     """Hardware ground-truth kernel exec time in milliseconds (CUPTI activity
-    sum, eager dispatch). ``None`` outside split timing. ``0.0`` if CUPTI was
-    unavailable (see ``kernel_gpu_ms_status``)."""
+    sum, eager dispatch). ``None`` outside split timing or when CUPTI was
+    unavailable (see ``kernel_gpu_ms_status``); never a 0.0 sentinel. Only
+    same-mechanism trials are aggregated: real CUPTI sums and CUDA-event
+    fallback values are never averaged together."""
     kernel_ms_status: Optional[str] = Field(default=None)
     """Status of the ``kernel_ms`` measurement (``"ok"`` when collected).
     ``None`` outside split timing."""
     kernel_gpu_ms_status: Optional[str] = Field(default=None)
     """Status of the ``kernel_gpu_ms`` measurement (``"ok"``,
-    ``"no_cupti:<Exception>"``, ``"cupti_no_samples"``). ``None`` outside
-    split timing."""
+    ``"ok_partial:<k>/<n>"`` — CUPTI succeeded on k of n trials and only those
+    were aggregated, ``"no_cupti:<Exception>"``, ``"cupti_no_samples"``,
+    ``"cupti_fallback:cuda_events"`` — values are CUDA-event timings, not CUPTI
+    activity sums). ``None`` outside split timing."""
     l2_cache_mode: Optional[str] = Field(default=None, pattern="^(cold|warm)$")
     """L2 policy used for all split-timing metrics. ``None`` outside split timing."""
 

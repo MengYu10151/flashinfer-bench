@@ -141,7 +141,10 @@ class PythonBuilder(Builder):
         # Optional per-workload setup hook: if the module exports a top-level ``setup``
         # symbol, the framework will invoke it once per workload before timed runs and
         # splat its returned dict as kwargs into ``run``. Used for derived static state
-        # (CSR indptr, expert ids, workspace tensors, plan handles).
+        # (CSR indptr, expert ids, workspace tensors, plan handles). The state must not
+        # depend on floating-point payload values — the evaluator enforces this by
+        # re-randomizing payload tensors and re-checking run() with the stale state
+        # (see Runnable._setup_callable for the full contract).
         setup_fn = getattr(mod, "setup", None)
         if setup_fn is not None and not callable(setup_fn):
             setup_fn = None

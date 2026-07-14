@@ -121,7 +121,7 @@ class TestMeasureKernelGpuCupti:
             ms, status = _measure_kernel_gpu_cupti(
                 runnable, [42], warmup=1, iters=1, device="cuda:0"
             )
-        assert ms == 0.0
+        assert ms is None  # unavailable is None, never a 0.0 sentinel
         assert status.startswith("no_cupti:")
         assert "ModuleNotFoundError" in status
         # setup is still called before the timer — verifies the contract
@@ -136,7 +136,7 @@ class TestMeasureKernelGpuCupti:
             ms, status = _measure_kernel_gpu_cupti(
                 runnable, [42], warmup=1, iters=1, device="cuda:0"
             )
-        assert ms == 0.0
+        assert ms is None
         assert status == "no_cupti:RuntimeError"
 
     def test_returns_cupti_no_samples_on_empty(self):
@@ -147,7 +147,7 @@ class TestMeasureKernelGpuCupti:
             ms, status = _measure_kernel_gpu_cupti(
                 runnable, [42], warmup=1, iters=1, device="cuda:0"
             )
-        assert ms == 0.0
+        assert ms is None
         assert status == "cupti_no_samples"
 
     def test_returns_ok_with_median_when_clean(self):
@@ -171,12 +171,7 @@ class TestMeasureKernelGpuCupti:
             return_value=[0.2],
         ) as bench:
             _measure_kernel_gpu_cupti(
-                runnable,
-                [42],
-                warmup=1,
-                iters=1,
-                device="cuda:0",
-                cold_l2_cache=cold_l2_cache,
+                runnable, [42], warmup=1, iters=1, device="cuda:0", cold_l2_cache=cold_l2_cache
             )
         assert bench.call_args.kwargs["cold_l2_cache"] is cold_l2_cache
 
@@ -256,34 +251,40 @@ class TestCudaEventL2Policy:
             return_value=[0.4],
         ) as bench:
             ms, status = _measure_kernel_cudaevent(
-                runnable,
-                [42],
-                warmup=1,
-                iters=1,
-                device="cuda:0",
-                cold_l2_cache=cold_l2_cache,
+                runnable, [42], warmup=1, iters=1, device="cuda:0", cold_l2_cache=cold_l2_cache
             )
         assert ms == pytest.approx(0.4)
         assert status == "ok"
         assert bench.call_args.kwargs["cold_l2_cache"] is cold_l2_cache
 
     @pytest.mark.parametrize("cold_l2_cache", [True, False])
-    def test_e2e_measurement_passes_l2_policy(self, cold_l2_cache):
-        runnable = _make_runnable(lambda *_args: None, lambda *_args: {})
-        with patch(
-            "flashinfer_bench.bench.timing.split_timing.bench_gpu_time_with_cuda_event",
-            return_value=[0.8],
-        ) as bench:
-            ms = _measure_e2e(
-                runnable,
-                [42],
-                warmup=1,
-                iters=1,
-                device="cuda:0",
-                cold_l2_cache=cold_l2_cache,
-            )
-        assert ms == pytest.approx(0.8)
-        assert bench.call_args.kwargs["cold_l2_cache"] is cold_l2_cache
+    def test_e2e_applies_l2_policy_per_iteration(self, cold_l2_cache, monkeypatch):
+        """e2e is host wall-clock — no flashinfer helper involved. The L2 flush
+        must run once per timed iteration when cold, never when warm."""
+        import flashinfer_bench.bench.timing.split_timing as st
+
+        calls = {"flush": 0, "setup": 0, "run": 0}
+        monkeypatch.setattr(
+            st, "_flush_l2", lambda _dev: calls.__setitem__("flush", calls["flush"] + 1)
+        )
+        monkeypatch.setattr(st.torch.cuda, "synchronize", lambda *_a, **_k: None)
+
+        def _setup(*_args):
+            calls["setup"] += 1
+            return {}
+
+        def _run(*_args):
+            calls["run"] += 1
+
+        runnable = _make_runnable(_run, _setup)
+        WARMUP, ITERS = 2, 3
+        ms = _measure_e2e(
+            runnable, [42], warmup=WARMUP, iters=ITERS, device="cuda:0", cold_l2_cache=cold_l2_cache
+        )
+        assert ms >= 0.0
+        assert calls["flush"] == (ITERS if cold_l2_cache else 0)
+        # setup + run stay paired inside the timed region, once per invocation
+        assert calls["setup"] == calls["run"] == WARMUP + ITERS
 
 
 # -----------------------------------------------------------------------------
@@ -314,9 +315,8 @@ class TestMeasureE2E:
         x = torch.randn(64, device="cuda")
         WARMUP, ITERS = 3, 5
         ms = _measure_e2e(runnable, [x], warmup=WARMUP, iters=ITERS, device="cuda:0")
-        # FlashInfer's timing helper may run additional estimation samples.
-        assert called["setup"] == called["run"]
-        assert called["setup"] >= WARMUP + ITERS
+        # Host wall-clock loop runs exactly warmup + iters invocations.
+        assert called["setup"] == called["run"] == WARMUP + ITERS
         assert ms > 0.0
 
     def test_tensors_are_cloned_per_iter(self):
@@ -397,9 +397,10 @@ class TestTimeRunnableSplitTiming:
         assert isinstance(m, SplitTimingMetrics)
         assert m.e2e_ms > 0.0
         assert m.kernel_ms > 0.0
-        # kernel_gpu_ms may be 0 if cupti is unavailable; status string then
+        # kernel_gpu_ms is None if cupti is unavailable; the status string then
         # documents the reason. Either way, status must be one of the known
         # values.
+        assert m.kernel_gpu_ms is None or m.kernel_gpu_ms > 0.0
         assert m.kernel_ms_status == "ok"
         assert m.kernel_gpu_ms_status in (
             "ok",
@@ -409,8 +410,8 @@ class TestTimeRunnableSplitTiming:
 
     def test_e2e_at_least_kernel(self):
         """e2e_ms >= kernel_ms (modulo run-to-run noise — give it some slack).
-        Rationale: e2e includes everything kernel_ms does, plus clone + setup
-        per iter."""
+        Rationale: e2e includes everything kernel_ms does, plus setup and a
+        per-iteration device sync inside the timed window."""
         a = torch.randn(512, device="cuda")
         out = torch.empty(512, device="cuda")
 

@@ -56,7 +56,16 @@ class Runnable:
     invokes ``setup_for_workload(*args)`` once before the timing/correctness loop for each
     workload; the returned dict is then passed as kwargs to every ``run`` call. Use this for
     derived static state (CSR indptr, expert ids, workspace tensors, plan handles) that the
-    kernel needs but that does not change across timed iterations."""
+    kernel needs but that does not change across timed iterations.
+
+    Contract: the returned state may depend on input METADATA — shapes, dtypes,
+    integer/bool tensors (lengths, indptr, indices, page tables) and scalars — but MUST NOT
+    depend on the VALUES of floating-point payload tensors (ndim >= 2, e.g. q/kv/activation
+    data). Anything value-dependent belongs in ``run``. The evaluator enforces this by
+    re-randomizing payload tensors after ``setup`` and re-checking ``run`` correctness
+    against a fresh reference while reusing the stale cached state; violations fail the
+    evaluation. This closes the loophole where a solution computes its full result inside
+    ``setup`` (outside every timed region) and has ``run`` replay the cached answer."""
     _cleaner: Optional[Callable[[], None]]
     """Optional cleanup function to release build artifacts and resources."""
 
@@ -85,6 +94,11 @@ class Runnable:
         self._workload_state: Optional[Dict[str, Any]] = None
         self.metadata = metadata
         self._cleaner = cleaner
+
+    @property
+    def has_setup_hook(self) -> bool:
+        """True when the solution module exported a per-workload ``setup`` hook."""
+        return self._setup_callable is not None
 
     def setup_for_workload(self, *args: Any) -> None:
         """Invoke the setup hook for the current workload and cache the returned state.

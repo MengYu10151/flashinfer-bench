@@ -5,12 +5,10 @@ Timing utilities for benchmarking FlashInfer-Bench kernel solutions.
 from __future__ import annotations
 
 import statistics
-from typing import Any, List
+from typing import Any, Callable, List
 
 import torch
 from flashinfer.testing import bench_gpu_time_with_cupti
-
-from flashinfer_bench.compile import Runnable
 
 from ._common import _device_lock
 from .split_timing import SplitTimingMetrics, time_runnable_split_timing
@@ -18,16 +16,20 @@ from .split_timing import SplitTimingMetrics, time_runnable_split_timing
 __all__ = ["time_runnable", "time_runnable_split_timing", "SplitTimingMetrics"]
 
 
-def time_runnable(fn: Runnable, args: List[Any], warmup: int, iters: int, device: str) -> float:
-    """Time the execution of a value-returning style Runnable kernel.
+def time_runnable(
+    fn: Callable[..., Any], args: List[Any], warmup: int, iters: int, device: str
+) -> float:
+    """Time the execution of a value-returning style kernel callable.
 
     Uses CUPTI activity tracing for precise hardware-level kernel timing,
     with automatic fallback to CUDA events if CUPTI is unavailable.
 
     Parameters
     ----------
-    fn : Runnable
-        The kernel function to benchmark (must be value-returning style).
+    fn : Callable
+        The kernel callable to benchmark — a ``Runnable`` or any wrapper with
+        the same positional call convention (e.g. the evaluator's
+        setup-plus-run closure for setup-hook solutions).
     args : List[Any]
         List of arguments in definition order.
     warmup : int

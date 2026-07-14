@@ -512,9 +512,10 @@ def cli():
         dest="split_timing",
         action="store_true",
         default=None,
-        help="Enable split timing: Performance gains e2e_ms (latency_ms) + kernel_ms "
-        "(eager CUDA Event) + kernel_gpu_ms (CUPTI activity sum). "
-        "Default: off (single-metric latency_ms only).",
+        help="Enable split timing: Performance additionally gains e2e_ms (serialized "
+        "wall-clock of setup + run) + kernel_ms (eager CUDA Event) + kernel_gpu_ms "
+        "(CUPTI activity sum). latency_ms / speedup_factor keep their single-metric "
+        "semantics. Default: off.",
     )
     l2_cache_group = run_parser.add_mutually_exclusive_group()
     l2_cache_group.add_argument(

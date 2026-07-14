@@ -3,13 +3,16 @@
 Produces three first-class metrics for any ``Runnable`` that follows the
 setup-hook convention (solution module exports a top-level ``setup`` symbol):
 
-* ``e2e_ms``        : full wrapper cost — each iter clones all tensor args
-                      AND re-runs setup() inside the timed region (cudaEvent,
-                      eager dispatch). Models a naive serving call.
+* ``e2e_ms``        : full wrapper cost — serialized host wall-clock of
+                      setup() + run() per invocation, synchronized every
+                      iteration. Models a naive serving call. Input clones
+                      happen OUTSIDE the timed window (harness overhead,
+                      not wrapper cost).
 * ``kernel_ms``     : eager ``run()`` latency measured with CUDA Events —
                       setup runs ONCE outside the timed region.
 * ``kernel_gpu_ms`` : hardware ground truth via CUPTI activity sum (eager
-                      dispatch, ``use_cuda_graph=False``). 0.0 if unavailable.
+                      dispatch, ``use_cuda_graph=False``). ``None`` if
+                      unavailable.
 
 The default single-metric timing path is unchanged; this module is only used
 when split timing is explicitly enabled.
@@ -21,7 +24,7 @@ import statistics
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from flashinfer.testing import bench_gpu_time_with_cuda_event, bench_gpu_time_with_cupti
@@ -35,14 +38,14 @@ from ._common import _device_lock
 class SplitTimingMetrics:
     """Output of :func:`time_runnable_split_timing`.
 
-    All times are medians in milliseconds. ``kernel_ms`` and ``kernel_gpu_ms``
-    are ``0.0`` if the corresponding measurement could not be taken (reason in
-    the ``*_status`` field, e.g. ``"no_cupti:ModuleNotFoundError"``).
+    All times are medians in milliseconds. ``kernel_gpu_ms`` is ``None`` if
+    the CUPTI measurement could not be taken (reason in the ``*_status``
+    field, e.g. ``"no_cupti:ModuleNotFoundError"``).
     """
 
     e2e_ms: float
     kernel_ms: float
-    kernel_gpu_ms: float
+    kernel_gpu_ms: Optional[float]
     kernel_ms_status: str
     """``"ok"`` when eager CUDA Event measurement completed."""
     kernel_gpu_ms_status: str
@@ -50,8 +53,10 @@ class SplitTimingMetrics:
     ``"cupti_no_samples"`` (CUPTI returned an empty list) |
     ``"cupti_fallback:cuda_events"`` (cupti-python installed but the library
     was unusable — e.g. cu12 container with cupti-python 13.x — and flashinfer
-    silently fell back to CUDA events; numbers are still valid but no longer a
-    CUPTI activity sum)."""
+    silently fell back to CUDA events; numbers are still valid CUDA-event
+    timings but no longer a CUPTI activity sum). ``kernel_gpu_ms`` is ``None``
+    for the two unavailable statuses so callers can never mistake a sentinel
+    for a measurement."""
 
 
 def time_runnable_split_timing(
@@ -75,14 +80,14 @@ def time_runnable_split_timing(
     warmup : int
         Warmup iterations before each timed measurement.
     iters : int
-        Timed iterations per metric (e2e CUDA Event samples, eager run-only
-        CUDA Event samples, and CUPTI activity rounds).
+        Timed iterations per metric (host wall-clock e2e samples, eager
+        run-only CUDA Event samples, and CUPTI activity rounds).
     device : str
         CUDA device id (e.g. ``"cuda:0"``).
     cold_l2_cache : bool
         Apply the same L2 policy to all three metrics. ``True`` flushes L2
         before each measured invocation; ``False`` preserves warm-cache state.
-        For ``e2e_ms`` this describes the start of the full clone + setup + run
+        For ``e2e_ms`` this describes the start of the full setup + run
         invocation, not the cache state at the internal ``run()`` boundary.
 
     Returns
@@ -121,11 +126,30 @@ def time_runnable_split_timing(
 # ---------------------------------------------------------------------------
 
 
+_L2_FLUSH_BUFFERS: Dict[str, "torch.Tensor"] = {}
+
+
 def _maybe_clone(a: Any) -> Any:
     """Deep-clone tensor args; pass-through scalars and non-tensor types."""
     if isinstance(a, torch.Tensor):
         return a.clone()
     return a
+
+
+def _flush_l2(device: str) -> None:
+    """Flush the device L2 by overwriting a 2x-L2-sized buffer.
+
+    Same policy as flashinfer's ``bench_gpu_time_*`` helpers (not reusable
+    here because the e2e loop is timed on the host side). The buffer is
+    cached per device across calls.
+    """
+    buf = _L2_FLUSH_BUFFERS.get(device)
+    if buf is None:
+        l2_size = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0)
+        size = (l2_size or 64 * 1024 * 1024) * 2
+        buf = torch.empty(size, dtype=torch.int8, device=device)
+        _L2_FLUSH_BUFFERS[device] = buf
+    buf.zero_()
 
 
 def _cool_down(device: str, seconds: float = 0.1) -> None:
@@ -151,31 +175,41 @@ def _measure_e2e(
     device: str,
     cold_l2_cache: bool = True,
 ) -> float:
-    """e2e_ms — clone all tensor args + re-run setup + run inside the timed region.
+    """e2e_ms — serialized host wall-clock of setup + run per invocation.
 
-    Each iter:
+    Each iteration:
 
-    1. Deep-clone every tensor in ``args``
-    2. ``runnable.setup_for_workload(*cloned)`` — rebuild plan handles, etc.
-       against the clones
-    3. ``runnable(*cloned)`` — the hot path
+    1. Deep-clone every tensor in ``args`` (OUTSIDE the timed window — the
+       clone protects against in-place mutation across iterations; it is
+       harness overhead, not wrapper cost)
+    2. Optional L2 flush, then synchronize
+    3. ``t0`` -> ``runnable.setup_for_workload(*cloned)`` ->
+       ``runnable(*cloned)`` -> synchronize -> ``t1``
 
-    All three steps are inside the cudaEvent timing region. This is the
-    worst-case naive-serving cost.
+    Host wall-clock with per-iteration synchronization is deliberate:
+    CUDA-event stream timing hides CPU-side wrapper work whenever the CPU can
+    run ahead of a busy GPU (iterations pipeline and only synchronize after
+    the loop). Serializing captures the per-call latency a naive serving
+    caller would actually observe, at the cost of one device sync per
+    iteration (µs-scale, negligible against wrapper work).
     """
-
-    def one(*_unused_args: Any) -> None:
+    for _ in range(warmup):
         cloned = tuple(_maybe_clone(a) for a in args)
         runnable.setup_for_workload(*cloned)
         runnable(*cloned)
+    torch.cuda.synchronize(device)
 
-    times = bench_gpu_time_with_cuda_event(
-        fn=one,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        input_args=tuple(args),
-        cold_l2_cache=cold_l2_cache,
-    )
+    times: List[float] = []
+    for _ in range(iters):
+        cloned = tuple(_maybe_clone(a) for a in args)
+        if cold_l2_cache:
+            _flush_l2(device)
+        torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
+        runnable.setup_for_workload(*cloned)
+        runnable(*cloned)
+        torch.cuda.synchronize(device)
+        times.append((time.perf_counter() - t0) * 1e3)
     return statistics.median(times)
 
 
@@ -206,10 +240,11 @@ def _measure_kernel_gpu_cupti(
     iters: int,
     device: str,
     cold_l2_cache: bool = True,
-) -> Tuple[float, str]:
+) -> Tuple[Optional[float], str]:
     """kernel_gpu_ms — setup ONCE outside; ``bench_gpu_time_with_cupti`` on
     eager dispatch. Uses CUPTI activity sum (pure GPU exec, excludes Python
-    inter-kernel gaps).
+    inter-kernel gaps). Returns ``None`` (never a 0.0 sentinel) when the
+    measurement is unavailable.
 
     Distinct mechanism from ``kernel_ms``: CUPTI activity sum versus eager
     CUDA Event elapsed time. A wider gap is diagnostic of multi-kernel launch
@@ -234,9 +269,9 @@ def _measure_kernel_gpu_cupti(
                 use_cuda_graph=False,
             )
         except Exception as ex:
-            return 0.0, f"no_cupti:{type(ex).__name__}"
+            return None, f"no_cupti:{type(ex).__name__}"
     if not times:
-        return 0.0, "cupti_no_samples"
+        return None, "cupti_no_samples"
     for w in caught:
         msg = str(w.message).lower()
         if "cupti" in msg and (

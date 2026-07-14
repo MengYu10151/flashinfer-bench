@@ -52,10 +52,12 @@ class ResolvedEvalConfig(BaseModel):
     profile_baseline: bool = True
     """Whether to profile the reference implementation for baseline latency."""
     split_timing: bool = False
-    """Opt-in: collect e2e_ms + kernel_ms + kernel_gpu_ms instead of a single
-    fused latency. When True, evaluators dispatch to ``time_runnable_split_timing``
-    and populate ``Performance.kernel_ms`` / ``kernel_gpu_ms`` alongside
-    ``latency_ms`` (which carries the e2e median). When False, behavior is
+    """Opt-in: additionally collect e2e_ms + kernel_ms + kernel_gpu_ms. When
+    True, evaluators dispatch to ``time_runnable_split_timing`` and populate
+    ``Performance.e2e_ms`` / ``kernel_ms`` / ``kernel_gpu_ms`` alongside
+    ``latency_ms``, which keeps its single-metric semantics (full solution
+    call; for setup-hook solutions the setup runs inside the timed region) so
+    ``speedup_factor`` stays comparable across modes. When False, behavior is
     unchanged from before split timing was introduced."""
     cold_l2_cache: bool = True
     """L2 policy shared by split-timing metrics. Defaults to cold L2, matching
