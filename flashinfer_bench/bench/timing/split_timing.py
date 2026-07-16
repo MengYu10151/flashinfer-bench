@@ -24,7 +24,7 @@ import statistics
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 from flashinfer.testing import bench_gpu_time_with_cuda_event, bench_gpu_time_with_cupti
@@ -126,9 +126,6 @@ def time_runnable_split_timing(
 # ---------------------------------------------------------------------------
 
 
-_L2_FLUSH_BUFFERS: Dict[str, "torch.Tensor"] = {}
-
-
 def _maybe_clone(a: Any) -> Any:
     """Deep-clone tensor args; pass-through scalars and non-tensor types."""
     if isinstance(a, torch.Tensor):
@@ -136,20 +133,22 @@ def _maybe_clone(a: Any) -> Any:
     return a
 
 
-def _flush_l2(device: str) -> None:
-    """Flush the device L2 by overwriting a 2x-L2-sized buffer.
+def _make_l2_flusher(device: str) -> Callable[[], None]:
+    """Build a flush-L2 callable holding a 2x-L2-sized scratch buffer.
 
     Same policy as flashinfer's ``bench_gpu_time_*`` helpers (not reusable
-    here because the e2e loop is timed on the host side). The buffer is
-    cached per device across calls.
+    here because the e2e loop is timed on the host side). The buffer lives
+    only as long as the returned closure, so its memory goes back to the
+    allocator after each measurement instead of staying pinned per device.
     """
-    buf = _L2_FLUSH_BUFFERS.get(device)
-    if buf is None:
-        l2_size = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0)
-        size = (l2_size or 64 * 1024 * 1024) * 2
-        buf = torch.empty(size, dtype=torch.int8, device=device)
-        _L2_FLUSH_BUFFERS[device] = buf
-    buf.zero_()
+    l2_size = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0)
+    size = (l2_size or 64 * 1024 * 1024) * 2
+    buf = torch.empty(size, dtype=torch.int8, device=device)
+
+    def _flush() -> None:
+        buf.zero_()
+
+    return _flush
 
 
 def _cool_down(device: str, seconds: float = 0.1) -> None:
@@ -193,8 +192,14 @@ def _measure_e2e(
     caller would actually observe, at the cost of one device sync per
     iteration (µs-scale, negligible against wrapper work).
     """
+    flush_l2 = _make_l2_flusher(device) if cold_l2_cache else None
+
+    # Warmup mirrors flashinfer's dry-run behavior: flush before every
+    # invocation under the cold-L2 policy.
     for _ in range(warmup):
         cloned = tuple(_maybe_clone(a) for a in args)
+        if flush_l2 is not None:
+            flush_l2()
         runnable.setup_for_workload(*cloned)
         runnable(*cloned)
     torch.cuda.synchronize(device)
@@ -202,8 +207,8 @@ def _measure_e2e(
     times: List[float] = []
     for _ in range(iters):
         cloned = tuple(_maybe_clone(a) for a in args)
-        if cold_l2_cache:
-            _flush_l2(device)
+        if flush_l2 is not None:
+            flush_l2()
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         runnable.setup_for_workload(*cloned)

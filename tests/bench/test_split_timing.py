@@ -260,13 +260,16 @@ class TestCudaEventL2Policy:
     @pytest.mark.parametrize("cold_l2_cache", [True, False])
     def test_e2e_applies_l2_policy_per_iteration(self, cold_l2_cache, monkeypatch):
         """e2e is host wall-clock — no flashinfer helper involved. The L2 flush
-        must run once per timed iteration when cold, never when warm."""
+        runs once per invocation (warmup + timed, mirroring flashinfer's
+        dry-run flush behavior) when cold, never when warm."""
         import flashinfer_bench.bench.timing.split_timing as st
 
         calls = {"flush": 0, "setup": 0, "run": 0}
-        monkeypatch.setattr(
-            st, "_flush_l2", lambda _dev: calls.__setitem__("flush", calls["flush"] + 1)
-        )
+
+        def _fake_flusher(_dev):
+            return lambda: calls.__setitem__("flush", calls["flush"] + 1)
+
+        monkeypatch.setattr(st, "_make_l2_flusher", _fake_flusher)
         monkeypatch.setattr(st.torch.cuda, "synchronize", lambda *_a, **_k: None)
 
         def _setup(*_args):
@@ -282,7 +285,7 @@ class TestCudaEventL2Policy:
             runnable, [42], warmup=WARMUP, iters=ITERS, device="cuda:0", cold_l2_cache=cold_l2_cache
         )
         assert ms >= 0.0
-        assert calls["flush"] == (ITERS if cold_l2_cache else 0)
+        assert calls["flush"] == (WARMUP + ITERS if cold_l2_cache else 0)
         # setup + run stay paired inside the timed region, once per invocation
         assert calls["setup"] == calls["run"] == WARMUP + ITERS
 

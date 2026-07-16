@@ -406,6 +406,29 @@ class TestSetupHook:
         assert r._workload_state == {}
         assert r(5) == 6  # no kwargs splat
 
+    def test_setup_hook_call_before_setup_raises(self):
+        """A setup-hook runnable invoked before setup_for_workload must fail
+        loudly. Silently running would use default kwarg values — misleading
+        results, and an evaluator that skips setup could time run() against
+        state it never built (the item-1 gaming vector through a side door)."""
+
+        def setup(a):
+            return {"bias": 1}
+
+        def run(a, *, bias=0):  # default makes the silent path tempting
+            return a + bias
+
+        metadata = RunnableMetadata(
+            build_type="python", definition_name="test", solution_name="test"
+        )
+        r = Runnable(callable=run, metadata=metadata, setup_callable=setup)
+        with pytest.raises(RuntimeError, match="setup_for_workload"):
+            r(1)
+
+        # After setup, the call works and sees the real state.
+        r.setup_for_workload(1)
+        assert r(1) == 2
+
     def test_setup_returns_non_dict_raises_type_error(self):
         """setup() returning a non-dict (e.g. tuple) should raise TypeError on setup_for_workload."""
 
