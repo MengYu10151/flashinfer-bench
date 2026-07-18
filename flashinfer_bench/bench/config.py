@@ -57,7 +57,10 @@ class ResolvedEvalConfig(BaseModel):
     ``Performance.e2e_ms`` / ``kernel_ms`` / ``kernel_gpu_ms`` alongside
     ``latency_ms``, which keeps its single-metric semantics (full solution
     call; for setup-hook solutions the setup runs inside the timed region) so
-    ``speedup_factor`` stays comparable across modes. When False, behavior is
+    ``speedup_factor`` stays comparable across modes. Cost: four measurement
+    phases per trial instead of one (kernel_ms, kernel_gpu_ms, e2e_ms, and
+    the standard latency_ms), roughly 4x the single-metric measurement time
+    plus ~0.4s of inter-phase cool-downs per trial. When False, behavior is
     unchanged from before split timing was introduced."""
     cold_l2_cache: bool = True
     """L2 policy shared by split-timing metrics. Defaults to cold L2, matching

@@ -222,5 +222,66 @@ def test_python_builder_ignores_non_callable_setup_symbol():
     assert runnable._setup_callable is None
 
 
+def test_python_builder_ignores_setup_with_mismatched_signature():
+    """Name-capture guard: a coincidental top-level `setup` whose signature cannot
+    bind run's positional args (e.g. `from setuptools import setup`, or a local
+    helper) must NOT silently become a per-workload hook — that would change how
+    an existing solution is invoked and timed."""
+    content = textwrap.dedent(
+        """
+        def setup(**kwargs):  # setuptools-style — cannot bind positional args
+            raise AssertionError("must never be called as a hook")
+
+        def run(A, B):
+            B.copy_(A)
+        """
+    )
+    definition = _make_pass_through_def()
+    solution = _make_solution(content, name="py_sol_capture_kwargs")
+    runnable = PythonBuilder().build(definition, solution)
+    assert runnable._setup_callable is None
+
+    content2 = textwrap.dedent(
+        """
+        def setup(config):  # arity mismatch vs run(A, B)
+            raise AssertionError("must never be called as a hook")
+
+        def run(A, B):
+            B.copy_(A)
+        """
+    )
+    solution2 = _make_solution(content2, name="py_sol_capture_arity")
+    runnable2 = PythonBuilder().build(definition, solution2)
+    assert runnable2._setup_callable is None
+
+    # And the solution still evaluates as a plain (hookless) runnable.
+    A = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    B = torch.zeros((2,), dtype=torch.float32)
+    runnable2.setup_for_workload(A, B)  # no-op
+    runnable2(A, B)
+    assert torch.allclose(B, A)
+
+
+def test_python_builder_required_kwonly_run_needs_matching_setup():
+    """run() with required kw-only params is only buildable when a matching setup
+    hook provides them; if the setup symbol is ignored by the name-capture guard,
+    the build must fail at COMPILE time exactly like pre-hook code."""
+    from flashinfer_bench.compile.builder import BuildError
+
+    content = textwrap.dedent(
+        """
+        def setup(config):  # mismatched — ignored by the guard
+            return {"scale": 2}
+
+        def run(A, B, *, scale):
+            B.copy_(A * scale)
+        """
+    )
+    definition = _make_pass_through_def()
+    solution = _make_solution(content, name="py_sol_kwonly_no_hook")
+    with pytest.raises(BuildError):
+        PythonBuilder().build(definition, solution)
+
+
 if __name__ == "__main__":
     pytest.main(sys.argv)

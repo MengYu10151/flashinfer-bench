@@ -49,7 +49,8 @@ class SplitTimingMetrics:
     kernel_ms_status: str
     """``"ok"`` when eager CUDA Event measurement completed."""
     kernel_gpu_ms_status: str
-    """``"ok"`` | ``"no_cupti:<Exception>"`` (cupti-python not importable) |
+    """``"ok"`` | ``"no_cupti:<Exception>"`` (the CUPTI benchmark raised —
+    CUPTI unavailable or errored at runtime) |
     ``"cupti_no_samples"`` (CUPTI returned an empty list) |
     ``"cupti_fallback:cuda_events"`` (cupti-python installed but the library
     was unusable — e.g. cu12 container with cupti-python 13.x — and flashinfer
@@ -112,6 +113,10 @@ def time_runnable_split_timing(
             )
             _cool_down(device)
             e2e_ms = _measure_e2e(runnable, args, warmup, iters, device, cold_l2_cache)
+            # Trailing cool-down so whatever runs next (the evaluator's full-call
+            # latency phase, or the next trial's kernel phase) starts from a
+            # settled device rather than right behind the heavy e2e phase.
+            _cool_down(device)
     return SplitTimingMetrics(
         e2e_ms=e2e_ms,
         kernel_ms=kernel_ms,
@@ -127,7 +132,9 @@ def time_runnable_split_timing(
 
 
 def _maybe_clone(a: Any) -> Any:
-    """Deep-clone tensor args; pass-through scalars and non-tensor types."""
+    """Clone top-level tensor args; pass-through scalars and other non-tensor
+    types. Tensors nested inside containers are not cloned — definition args
+    are flat (tensors and scalars) by construction."""
     if isinstance(a, torch.Tensor):
         return a.clone()
     return a

@@ -4,7 +4,7 @@ import math
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from .utils import BaseModelWithDocstrings, NonEmptyString
 from .workload import Workload
@@ -64,10 +64,12 @@ class Performance(BaseModelWithDocstrings):
     """Performance speedup factor compared to reference (reference_time / solution_time).
     Numerator and denominator are measured with the same mechanism and scope."""
     e2e_ms: Optional[float] = Field(default=None, ge=0.0)
-    """Serialized host wall-clock median of setup + run per invocation, with a
+    """Serialized host wall-clock latency of setup + run per invocation, with a
     device synchronization every iteration (split timing only). Unlike
-    ``latency_ms`` (stream timing that can pipeline), this captures CPU-side
-    wrapper cost even when the GPU is saturated. ``None`` outside split timing."""
+    ``latency_ms`` (GPU-side timing that can hide CPU work under a busy GPU),
+    this captures CPU-side wrapper cost even when the GPU is saturated.
+    Aggregated as the mean across trials of per-trial medians (the same
+    convention as ``latency_ms``). ``None`` outside split timing."""
     kernel_ms: Optional[float] = Field(default=None, ge=0.0)
     """Eager ``run()`` latency in milliseconds measured with CUDA Events after
     one setup call outside timing. ``None`` outside split timing."""
@@ -87,7 +89,32 @@ class Performance(BaseModelWithDocstrings):
     ``"cupti_fallback:cuda_events"`` — values are CUDA-event timings, not CUPTI
     activity sums). ``None`` outside split timing."""
     l2_cache_mode: Optional[str] = Field(default=None, pattern="^(cold|warm)$")
-    """L2 policy used for all split-timing metrics. ``None`` outside split timing."""
+    """L2 policy used for the split-timing metrics (``e2e_ms`` / ``kernel_ms`` /
+    ``kernel_gpu_ms``). ``latency_ms`` and ``reference_latency_ms`` are always
+    measured with ``time_runnable``'s cold-L2 policy regardless of this setting.
+    ``None`` outside split timing."""
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_split_fields(self, handler):
+        """Drop split-timing fields that are None from serialized output.
+
+        Traces written without split timing stay byte-identical to
+        pre-split-timing output, so dataset diffs / content hashes are stable
+        and ``merge``/export does not rewrite historical traces. Absent keys
+        deserialize back to None, so round-tripping is lossless.
+        """
+        data = handler(self)
+        for key in (
+            "e2e_ms",
+            "kernel_ms",
+            "kernel_gpu_ms",
+            "kernel_ms_status",
+            "kernel_gpu_ms_status",
+            "l2_cache_mode",
+        ):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class Environment(BaseModelWithDocstrings):

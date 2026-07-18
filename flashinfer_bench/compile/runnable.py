@@ -60,11 +60,14 @@ class Runnable:
 
     Contract: the returned state may depend on input METADATA — shapes, dtypes,
     integer/bool tensors (lengths, indptr, indices, page tables) and scalars — but MUST NOT
-    depend on the VALUES of floating-point payload tensors (ndim >= 2, e.g. q/kv/activation
-    data). Anything value-dependent belongs in ``run``. The evaluator enforces this by
-    re-randomizing payload tensors after ``setup`` and re-checking ``run`` correctness
-    against a fresh reference while reusing the stale cached state; violations fail the
-    evaluation. This closes the loophole where a solution computes its full result inside
+    depend on the VALUES of payload tensors: floating-point tensors with ndim >= 2
+    (q/kv/activation data), including packed-quantized weight representations stored in
+    integer dtypes (unpacking/dequantizing them in ``setup`` moves per-call work outside
+    the timed region and violates the contract even though the automated check cannot
+    mutate them). Anything value-dependent belongs in ``run``. The evaluator enforces the
+    floating-payload half mechanically by re-randomizing payload tensors after ``setup``
+    and re-checking ``run`` correctness against a fresh reference while reusing the stale
+    cached state; violations fail the evaluation. This closes the loophole where a solution computes its full result inside
     ``setup`` (outside every timed region) and has ``run`` replay the cached answer.
 
     Setup hooks are currently exercised by the DefaultEvaluator flow; evaluators that

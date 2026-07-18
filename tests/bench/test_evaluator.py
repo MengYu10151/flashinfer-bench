@@ -572,6 +572,7 @@ class TestSetupPayloadIndependence:
         cfg = ResolvedEvalConfig(num_trials=1, warmup_runs=0, iterations=1)
         device = "cuda:0"
         inp = [torch.randn(4, 4, device=device)]
+        original_payload = inp[0].clone()
         ref = [inp[0].clone()]
 
         evaluation = DefaultEvaluator.evaluate(
@@ -586,6 +587,10 @@ class TestSetupPayloadIndependence:
         )
 
         assert evaluation.status == EvaluationStatus.PASSED
+        # The payload-independence check must restore the original payload so
+        # timing runs on the true workload values (value-dependent kernels,
+        # safetensors-captured data).
+        assert torch.equal(inp[0], original_payload)
 
 
 # =============================================================================

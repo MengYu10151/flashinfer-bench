@@ -107,8 +107,7 @@ def test_cli_override_beats_yaml_op_type():
 def test_l2_policy_respects_config_precedence():
     definition = SimpleNamespace(op_type="moe", name="some_moe_def")
     cfg = BenchmarkConfig(
-        cold_l2_cache=False,
-        op_type_config={"moe": EvalConfig(cold_l2_cache=True)},
+        cold_l2_cache=False, op_type_config={"moe": EvalConfig(cold_l2_cache=True)}
     )
     assert cfg.resolve_eval_config(definition).cold_l2_cache is False
 

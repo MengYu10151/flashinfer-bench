@@ -248,9 +248,9 @@ class DefaultEvaluator(Evaluator):
         reference on the mutated inputs.
 
         Returns None when the check passes (or is vacuous), otherwise a failed
-        Evaluation. The mutated trial keeps its new payload values afterwards —
-        harmless, since correctness already passed and timing for these kernels
-        is value-independent.
+        Evaluation. The original payload values are restored before returning,
+        so subsequent timing runs on the true workload data (value-dependent
+        kernels, safetensors-captured payloads).
         """
         inp = inputs[0]
         is_dps = sol_runnable.metadata.destination_passing_style
@@ -262,28 +262,30 @@ class DefaultEvaluator(Evaluator):
         else:
             sol_runnable.setup_for_workload(*inp)
 
-        # 2. Re-randomize floating payload tensors in place (same generator
-        #    family as gen_inputs; sampling "probs" keeps its simplex property).
         names = list(definition.inputs.keys())
-        mutated = 0
-        with torch.no_grad():
-            for name, arg in zip(names, inp):
-                if not isinstance(arg, torch.Tensor):
-                    continue
-                if not arg.is_floating_point() or arg.ndim < _PAYLOAD_MIN_NDIM:
-                    continue
-                fresh = torch.randn(arg.shape, dtype=torch.float32, device=arg.device)
-                if is_sampling_operation(definition) and name == "probs":
-                    fresh = torch.softmax(fresh, dim=-1)
-                elif arg.element_size() == 1:
-                    # low-precision floats (fp8/fp4): clamp like gen_inputs does
-                    fresh = fresh.clamp_(-2.0, 2.0)
-                arg.copy_(fresh.to(arg.dtype))
-                mutated += 1
-        if mutated == 0:
-            return None  # no payload tensors — nothing to enforce
-
+        saved: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        failure: Optional[Correctness] = None
         try:
+            # 2. Re-randomize floating payload tensors in place (same generator
+            #    family as gen_inputs; sampling "probs" keeps its simplex
+            #    property), remembering originals for restoration.
+            with torch.no_grad():
+                for name, arg in zip(names, inp):
+                    if not isinstance(arg, torch.Tensor):
+                        continue
+                    if not arg.is_floating_point() or arg.ndim < _PAYLOAD_MIN_NDIM:
+                        continue
+                    saved.append((arg, arg.clone()))
+                    fresh = torch.randn(arg.shape, dtype=torch.float32, device=arg.device)
+                    if is_sampling_operation(definition) and name == "probs":
+                        fresh = torch.softmax(fresh, dim=-1)
+                    elif arg.element_size() == 1:
+                        # low-precision floats (fp8/fp4): clamp like gen_inputs does
+                        fresh = fresh.clamp_(-2.0, 2.0)
+                    arg.copy_(fresh.to(arg.dtype))
+            if not saved:
+                return None  # no payload tensors — nothing to enforce
+
             # 3. Fresh reference on the mutated inputs.
             ref_runnable = BuilderRegistry.get_instance().build_reference(definition)
             with torch.no_grad():
@@ -303,29 +305,53 @@ class DefaultEvaluator(Evaluator):
                     result = sol_runnable(*inp)
                 torch.cuda.synchronize(device)
                 out = normalize_result(definition, result, device)
+
+            # 5. Compare, with a non-finite screen mirroring the main loop
+            #    (compute_error_stats treats NaN as within tolerance).
+            for sol_tensor, ref_tensor in zip(out, ref_out):
+                if not torch.isfinite(ref_tensor.to(torch.float32)).all().item():
+                    # The reference degenerated on randomized payload
+                    # (domain-constrained op) — comparison is meaningless here.
+                    continue
+                if not torch.isfinite(sol_tensor.to(torch.float32)).all().item():
+                    failure = Correctness(
+                        max_relative_error=float("nan"), max_absolute_error=float("nan")
+                    )
+                    break
+                abs_err, rel_err, exceeds_tol, _ = compute_error_stats(sol_tensor, ref_tensor, cfg)
+                if exceeds_tol:
+                    failure = Correctness(max_relative_error=rel_err, max_absolute_error=abs_err)
+                    break
         except Exception:
             traceback.print_exc()
             return make_eval(
                 status=EvaluationStatus.RUNTIME_ERROR, device=device, log_path=log_path
             )
+        finally:
+            # Restore original payload values regardless of outcome.
+            with torch.no_grad():
+                for arg, original in saved:
+                    arg.copy_(original)
 
-        for sol_tensor, ref_tensor in zip(out, ref_out):
-            abs_err, rel_err, exceeds_tol, _ = compute_error_stats(sol_tensor, ref_tensor, cfg)
-            if exceeds_tol:
-                print(
-                    "setup-payload-independence check FAILED: run() with the cached "
-                    "setup() state no longer matches the reference after payload "
-                    "re-randomization. setup() state must not depend on floating-point "
-                    f"payload values (max_abs={abs_err:.3e}, max_rel={rel_err:.3e}).",
-                    file=sys.stderr,
-                )
-                correctness = Correctness(max_relative_error=rel_err, max_absolute_error=abs_err)
-                return make_eval(
-                    status=EvaluationStatus.INCORRECT_NUMERICAL,
-                    device=device,
-                    log_path=log_path,
-                    correctness=correctness,
-                )
+        if failure is not None:
+            print(
+                "setup-payload-independence check FAILED: run() with the cached "
+                "setup() state no longer matches the reference after payload "
+                "re-randomization. setup() state must not depend on floating-point "
+                f"payload values (max_abs={failure.max_absolute_error:.3e}, "
+                f"max_rel={failure.max_relative_error:.3e}).",
+                file=sys.stderr,
+            )
+            return make_eval(
+                status=EvaluationStatus.INCORRECT_NUMERICAL,
+                device=device,
+                log_path=log_path,
+                correctness=failure,
+                extra_msg=(
+                    "setup_payload_dependence: run() with cached setup() state does not "
+                    "match a fresh reference after payload re-randomization"
+                ),
+            )
         return None
 
     @classmethod

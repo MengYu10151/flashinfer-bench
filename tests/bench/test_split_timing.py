@@ -427,6 +427,6 @@ class TestTimeRunnableSplitTiming:
 
         runnable = _make_runnable(_run, _setup)
         m = time_runnable_split_timing(runnable, [a], warmup=5, iters=10, device="cuda:0")
-        # 5x slack to absorb noise on extremely small kernels; the inequality
+        # 2x slack to absorb noise on extremely small kernels; the inequality
         # is robust on any non-trivial workload.
         assert m.e2e_ms >= m.kernel_ms * 0.5
