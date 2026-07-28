@@ -507,7 +507,8 @@ def cli():
         help="Skip profiling the reference implementation (correctness check still runs). "
         "Useful when the reference is slow (e.g. large prefill workloads).",
     )
-    run_parser.add_argument(
+    split_timing_group = run_parser.add_mutually_exclusive_group()
+    split_timing_group.add_argument(
         "--split-timing",
         dest="split_timing",
         action="store_true",
@@ -516,6 +517,13 @@ def cli():
         "wall-clock of setup + run) + kernel_ms (eager CUDA Event) + kernel_gpu_ms "
         "(CUPTI activity sum). latency_ms / speedup_factor keep their single-metric "
         "semantics. Default: off.",
+    )
+    split_timing_group.add_argument(
+        "--no-split-timing",
+        dest="split_timing",
+        action="store_false",
+        help="Disable split timing even when a config file enables it. Omitting both "
+        "flags leaves the setting to the config layers.",
     )
     l2_cache_group = run_parser.add_mutually_exclusive_group()
     l2_cache_group.add_argument(
