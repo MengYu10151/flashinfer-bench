@@ -376,11 +376,16 @@ class DefaultEvaluator(Evaluator):
             try:
                 trial_metrics: List[SplitTimingMetrics] = []
                 trial_latencies: List[float] = []
-                for inp in inputs:
+                for trial_index, inp in enumerate(inputs):
                     args = _args_for(inp)
                     # time_runnable_split_timing handles setup invocation internally
                     # (once-outside for kernel_ms / kernel_gpu_ms; per-iter for
                     # e2e_ms). Do NOT call setup_for_workload here.
+                    #
+                    # trial_index drives the phase rotation: over num_trials the
+                    # three split phases each occupy every slot, so the means
+                    # below cannot inherit a fixed-position bias from the
+                    # measurement schedule.
                     metrics = time_runnable_split_timing(
                         sol_runnable,
                         args,
@@ -388,15 +393,19 @@ class DefaultEvaluator(Evaluator):
                         cfg.iterations,
                         device,
                         cold_l2_cache=cfg.cold_l2_cache,
+                        trial_index=trial_index,
+                        rotate_phases=cfg.split_phase_rotation,
                     )
                     trial_metrics.append(metrics)
                     # latency_ms keeps its single-metric semantics under split
                     # timing: the full solution call (setup inside the timed
                     # region for setup-hook solutions) measured by the same
                     # mechanism as reference_latency_ms — so speedup_factor
-                    # stays apples-to-apples. Measured AFTER the split metrics
-                    # so the kernel-only phases stay uncontaminated by wrapper
-                    # state (see measurement-order note in split_timing).
+                    # stays apples-to-apples. Deliberately kept OUT of the phase
+                    # rotation and always measured last, behind the trailing
+                    # cool-down: its protocol must stay identical to non-split
+                    # runs, since it is the number historical traces and the
+                    # leaderboard compare against.
                     lat_ms = time_runnable(
                         _full_call_target(sol_runnable),
                         args,

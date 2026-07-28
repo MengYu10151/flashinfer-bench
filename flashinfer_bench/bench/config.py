@@ -65,6 +65,13 @@ class ResolvedEvalConfig(BaseModel):
     cold_l2_cache: bool = True
     """L2 policy shared by split-timing metrics. Defaults to cold L2, matching
     FlashInfer's benchmark helpers. Set False for warm-cache measurements."""
+    split_phase_rotation: bool = True
+    """Rotate the three split-timing phases by trial index so each metric
+    occupies every slot of the sequence across trials, and the cross-trial mean
+    cannot inherit a fixed-position bias. Deterministic (a pure function of the
+    trial index), so runs stay reproducible. Set False to pin the legacy fixed
+    order (kernel, kernel_gpu, e2e) when comparing the two schedules. Has no
+    effect unless ``split_timing`` is True; ``latency_ms`` is never rotated."""
     extra: Dict[str, Any] = Field(default_factory=dict)
     """Evaluator-specific parameters after all config layers have been merged."""
 

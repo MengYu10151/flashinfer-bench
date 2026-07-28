@@ -33,6 +33,28 @@ from flashinfer_bench.compile import Runnable
 
 from ._common import _device_lock
 
+_PHASE_SEQUENCE: Tuple[str, ...] = ("kernel", "kernel_gpu", "e2e")
+"""Base order of the three measurement phases within one trial."""
+
+
+def _rotated_phase_order(trial_index: int, rotate: bool) -> Tuple[str, ...]:
+    """Cyclically rotate :data:`_PHASE_SEQUENCE` by ``trial_index``.
+
+    With three phases and the default ``num_trials=3``, every metric occupies
+    every slot of the sequence exactly once, so the cross-trial mean cancels
+    any first-order position effect instead of baking it into one metric.
+
+    The rotation is a pure function of the trial index — never randomized — so
+    a run remains reproducible and a trace can be reproduced phase-for-phase.
+
+    ``rotate=False`` pins the legacy fixed order (kernel-only phases first,
+    heavy e2e last), kept so the two schedules can be compared directly.
+    """
+    if not rotate:
+        return _PHASE_SEQUENCE
+    offset = trial_index % len(_PHASE_SEQUENCE)
+    return _PHASE_SEQUENCE[offset:] + _PHASE_SEQUENCE[:offset]
+
 
 @dataclass(frozen=True)
 class SplitTimingMetrics:
@@ -59,6 +81,10 @@ class SplitTimingMetrics:
     for the two unavailable statuses so callers can never mistake a sentinel
     for a measurement."""
 
+    phase_order: Tuple[str, ...] = _PHASE_SEQUENCE
+    """Order the phases actually ran in for this trial. Diagnostic only — not
+    serialized into ``Performance``; the trace schema is unchanged."""
+
 
 def time_runnable_split_timing(
     runnable: Runnable,
@@ -68,6 +94,8 @@ def time_runnable_split_timing(
     device: str,
     *,
     cold_l2_cache: bool = True,
+    trial_index: int = 0,
+    rotate_phases: bool = True,
 ) -> SplitTimingMetrics:
     """Measure e2e / kernel / kernel_gpu in one call.
 
@@ -90,39 +118,70 @@ def time_runnable_split_timing(
         before each measured invocation; ``False`` preserves warm-cache state.
         For ``e2e_ms`` this describes the start of the full setup + run
         invocation, not the cache state at the internal ``run()`` boundary.
+    trial_index : int
+        Index of the current trial. Selects the phase rotation offset so each
+        metric visits every slot of the sequence across trials.
+    rotate_phases : bool
+        ``True`` (default) rotates the phase order by ``trial_index``.
+        ``False`` pins the legacy fixed order (kernel, kernel_gpu, e2e) so the
+        two schedules can be compared directly.
 
     Returns
     -------
     SplitTimingMetrics
-        e2e_ms, kernel_ms, kernel_gpu_ms (medians) and status strings.
+        e2e_ms, kernel_ms, kernel_gpu_ms (medians), status strings, and the
+        phase order this trial actually ran in.
     """
-    # Measurement order: kernel_ms -> kernel_gpu_ms -> e2e.
+    # Phase order rotates with the trial index, so no metric is permanently
+    # measured in the same slot. Whatever a phase inherits from its predecessor
+    # — device clocks, allocator state, a solution-private cache re-keyed by
+    # e2e's per-iteration clones — lands on a different metric each trial and
+    # averages out across trials instead of biasing one number every run.
     #
-    # Run the kernel-only measurements first so their values are less likely to
-    # be affected by any persistent wrapper state, synchronization, or GPU clock
-    # effects introduced by the heavier end-to-end phase.
+    # This is a second, structural line of defense rather than the primary one:
+    # every phase re-warms and (under cold-L2) flushes before each timed
+    # iteration, and reports a median, so inherited state is already absorbed
+    # before any sample is taken. What rotation adds is that a hypothetical
+    # residual position effect becomes visible trial-to-trial spread instead of
+    # an invisible constant bias on whichever metric happens to run last.
+    #
+    # The evaluator's official latency phase deliberately stays OUT of this
+    # rotation: it keeps its exact pre-split protocol (measured after this
+    # sequence, behind a trailing cool-down) so latency_ms stays
+    # mechanism-identical to non-split runs and to historical traces.
+    order = _rotated_phase_order(trial_index, rotate_phases)
+    kernel_ms = 0.0
+    kernel_status = "not_run"
+    kernel_gpu_ms: Optional[float] = None
+    kernel_gpu_status = "not_run"
+    e2e_ms = 0.0
+
     lock = _device_lock(device)
     with lock:
         with torch.cuda.device(device):
-            kernel_ms, kernel_status = _measure_kernel_cudaevent(
-                runnable, args, warmup, iters, device, cold_l2_cache
-            )
-            _cool_down(device)
-            kernel_gpu_ms, kernel_gpu_status = _measure_kernel_gpu_cupti(
-                runnable, args, warmup, iters, device, cold_l2_cache
-            )
-            _cool_down(device)
-            e2e_ms = _measure_e2e(runnable, args, warmup, iters, device, cold_l2_cache)
-            # Trailing cool-down so whatever runs next (the evaluator's full-call
-            # latency phase, or the next trial's kernel phase) starts from a
-            # settled device rather than right behind the heavy e2e phase.
-            _cool_down(device)
+            for phase in order:
+                if phase == "kernel":
+                    kernel_ms, kernel_status = _measure_kernel_cudaevent(
+                        runnable, args, warmup, iters, device, cold_l2_cache
+                    )
+                elif phase == "kernel_gpu":
+                    kernel_gpu_ms, kernel_gpu_status = _measure_kernel_gpu_cupti(
+                        runnable, args, warmup, iters, device, cold_l2_cache
+                    )
+                else:
+                    e2e_ms = _measure_e2e(runnable, args, warmup, iters, device, cold_l2_cache)
+                # Cool down after every phase, including the last one, so the
+                # next phase — or the evaluator's latency phase, or the next
+                # trial — starts from a settled device rather than right behind
+                # whatever just ran.
+                _cool_down(device)
     return SplitTimingMetrics(
         e2e_ms=e2e_ms,
         kernel_ms=kernel_ms,
         kernel_gpu_ms=kernel_gpu_ms,
         kernel_ms_status=kernel_status,
         kernel_gpu_ms_status=kernel_gpu_status,
+        phase_order=order,
     )
 
 

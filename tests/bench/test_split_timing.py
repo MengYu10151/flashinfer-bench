@@ -7,6 +7,7 @@ tests are guarded with ``pytest.mark.skipif(torch.cuda.device_count() == 0)``.
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from unittest.mock import patch
 
@@ -15,10 +16,12 @@ import torch
 
 from flashinfer_bench.bench.timing import SplitTimingMetrics, time_runnable_split_timing
 from flashinfer_bench.bench.timing.split_timing import (
+    _PHASE_SEQUENCE,
     _maybe_clone,
     _measure_e2e,
     _measure_kernel_cudaevent,
     _measure_kernel_gpu_cupti,
+    _rotated_phase_order,
 )
 from flashinfer_bench.compile import Runnable, RunnableMetadata
 
@@ -430,3 +433,103 @@ class TestTimeRunnableSplitTiming:
         # 2x slack to absorb noise on extremely small kernels; the inequality
         # is robust on any non-trivial workload.
         assert m.e2e_ms >= m.kernel_ms * 0.5
+
+
+# -----------------------------------------------------------------------------
+# Cross-trial phase rotation
+# -----------------------------------------------------------------------------
+
+_SPLIT_MOD = "flashinfer_bench.bench.timing.split_timing"
+
+
+class TestPhaseRotation:
+    """Rotation must be deterministic, cover every slot, and stay opt-out-able.
+
+    CPU-only: the ordering rule is a pure function, and the dispatch is checked
+    with the three measurement helpers mocked out."""
+
+    def test_full_cycle_puts_every_phase_in_every_slot(self):
+        orders = [_rotated_phase_order(i, True) for i in range(3)]
+        assert orders == [
+            ("kernel", "kernel_gpu", "e2e"),
+            ("kernel_gpu", "e2e", "kernel"),
+            ("e2e", "kernel", "kernel_gpu"),
+        ]
+        # The property that makes the cross-trial mean position-unbiased: over a
+        # full cycle each slot is occupied by each phase exactly once.
+        for slot in range(len(_PHASE_SEQUENCE)):
+            assert {o[slot] for o in orders} == set(_PHASE_SEQUENCE)
+
+    def test_rotation_is_deterministic_and_wraps(self):
+        # Same trial index always yields the same order — no randomization, so
+        # a run stays reproducible phase-for-phase.
+        for i in range(10):
+            assert _rotated_phase_order(i, True) == _rotated_phase_order(i, True)
+            assert _rotated_phase_order(i, True) == _rotated_phase_order(
+                i + len(_PHASE_SEQUENCE), True
+            )
+
+    def test_disabled_pins_legacy_fixed_order(self):
+        for i in range(5):
+            assert _rotated_phase_order(i, False) == _PHASE_SEQUENCE
+
+    def test_trial_zero_matches_pre_rotation_behavior(self):
+        # Guards backward compatibility: the first trial runs the same order the
+        # engine used before rotation existed.
+        assert _rotated_phase_order(0, True) == _PHASE_SEQUENCE
+
+    def _dispatch(self, trial_index, rotate=True):
+        """Run the public API with all three measurements mocked; return the
+        observed execution order and the metrics object."""
+        runnable = _make_runnable(lambda *a: None)
+        calls = []
+
+        def _fake_kernel(*a, **k):
+            calls.append("kernel")
+            return 1.0, "ok"
+
+        def _fake_gpu(*a, **k):
+            calls.append("kernel_gpu")
+            return 2.0, "ok"
+
+        def _fake_e2e(*a, **k):
+            calls.append("e2e")
+            return 3.0
+
+        with patch(f"{_SPLIT_MOD}._measure_kernel_cudaevent", _fake_kernel), patch(
+            f"{_SPLIT_MOD}._measure_kernel_gpu_cupti", _fake_gpu
+        ), patch(f"{_SPLIT_MOD}._measure_e2e", _fake_e2e), patch(
+            f"{_SPLIT_MOD}._cool_down", lambda *a, **k: None
+        ), patch(
+            # No GPU needed once the measurements are mocked.
+            "torch.cuda.device",
+            lambda d: contextlib.nullcontext(),
+        ):
+            m = time_runnable_split_timing(
+                runnable,
+                [],
+                warmup=1,
+                iters=1,
+                device="cuda:0",
+                trial_index=trial_index,
+                rotate_phases=rotate,
+            )
+        return tuple(calls), m
+
+    def test_dispatch_executes_in_rotated_order(self):
+        calls, m = self._dispatch(trial_index=1)
+        assert calls == ("kernel_gpu", "e2e", "kernel")
+        assert m.phase_order == ("kernel_gpu", "e2e", "kernel")
+
+    def test_dispatch_routes_values_to_correct_fields(self):
+        # Run order must not change which metric a value lands in.
+        for trial_index in range(3):
+            _, m = self._dispatch(trial_index=trial_index)
+            assert (m.kernel_ms, m.kernel_gpu_ms, m.e2e_ms) == (1.0, 2.0, 3.0)
+            assert m.kernel_ms_status == "ok"
+            assert m.kernel_gpu_ms_status == "ok"
+
+    def test_dispatch_honors_rotation_opt_out(self):
+        calls, m = self._dispatch(trial_index=2, rotate=False)
+        assert calls == _PHASE_SEQUENCE
+        assert m.phase_order == _PHASE_SEQUENCE
